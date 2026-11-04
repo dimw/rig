@@ -93,8 +93,22 @@ def validate_var_name(name: str) -> str:
 
 
 def resolve_project_dir(start: Optional[str] = None) -> str:
-    """Prefer the git root (where rig init writes .rig/), else cwd."""
+    """Prefer the nearest ancestor with ``rig.yml`` (cwd or git subfolder).
+
+    Falls back to the git toplevel when no ``rig.yml`` is found above ``start``,
+    then to cwd. This matches ``rig init``, which writes into the current
+    directory even when that directory is nested inside a larger git repo.
+    """
     start = os.path.abspath(start or os.getcwd())
+    cursor = start
+    while True:
+        if os.path.isfile(os.path.join(cursor, "rig.yml")):
+            return cursor
+        parent = os.path.dirname(cursor)
+        if parent == cursor:
+            break
+        cursor = parent
+
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],

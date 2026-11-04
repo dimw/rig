@@ -2,6 +2,7 @@
 
 import io
 import os
+import subprocess
 import sys
 from unittest.mock import patch
 
@@ -24,6 +25,7 @@ from cli.encrypt import (
     read_single_line_value,
     read_variable_name,
     read_vscode_browser_password,
+    resolve_project_dir,
     resolve_repo_pat_var_names,
     to_https_git_url,
     upsert_vault_var,
@@ -186,6 +188,20 @@ def test_vars_path_for_project(tmp_path):
     project = tmp_path / "repo"
     project.mkdir()
     assert vars_path_for_project(str(project)) == str(project / ".rig" / "vars.yml")
+
+
+def test_resolve_project_dir_prefers_nearest_rig_yml(tmp_path):
+    monorepo = tmp_path / "monorepo"
+    nested = monorepo / "apps" / "web" / "src"
+    nested.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=monorepo, check=True, capture_output=True)
+    (monorepo / "rig.yml").write_text("kind: workspace\n")
+    workspace = monorepo / "apps" / "web"
+    (workspace / "rig.yml").write_text("kind: workspace\nname: web\n")
+
+    assert resolve_project_dir(str(nested)) == str(workspace)
+    assert resolve_project_dir(str(workspace)) == str(workspace)
+    assert vars_path_for_project(str(nested)) == str(workspace / ".rig" / "vars.yml")
 
 
 def test_encrypt_named_value_roundtrip_with_real_ansible_vault(tmp_path):

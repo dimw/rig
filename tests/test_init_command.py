@@ -76,6 +76,46 @@ def test_resolve_context_from_git_repo_offers_siblings(tmp_path):
     assert names == {"api", "web"}
 
 
+def test_resolve_context_from_git_subfolder_keeps_cwd_as_root(tmp_path):
+    monorepo = tmp_path / "monorepo"
+    apps_web = monorepo / "apps" / "web"
+    apps_web.mkdir(parents=True)
+    _git_init(monorepo, "https://github.com/org/monorepo.git")
+
+    context = resolve_init_context(str(apps_web))
+    assert context["root"] == str(apps_web)
+    assert context["in_git_repo"] is True
+    assert context["current"] == str(monorepo)
+    assert {project["name"] for project in context["projects"]} == {"monorepo"}
+
+
+def test_interactive_init_in_git_subfolder_writes_locally(tmp_path):
+    monorepo = tmp_path / "monorepo"
+    apps_web = monorepo / "apps" / "web"
+    apps_web.mkdir(parents=True)
+    _git_init(monorepo, "https://github.com/org/monorepo.git")
+    data_key = tmp_path / "data-key"
+    data_key.write_text("vault-pass\n")
+
+    answers = iter(["", "web", "", ""])  # current repo, name, agent, editor
+    assert interactive_env_init(
+        str(apps_web),
+        input_fn=lambda _prompt: next(answers),
+        secret_fn=lambda _prompt: "",
+        config_path=str(tmp_path / "rig-config"),
+        data_key_path=str(data_key),
+    )
+
+    assert (apps_web / "rig.yml").is_file()
+    assert (apps_web / ".rig" / "workspace.yml").is_file()
+    assert not (monorepo / "rig.yml").exists()
+    assert not (monorepo / ".rig").exists()
+    manifest = yaml.safe_load((apps_web / "rig.yml").read_text())
+    assert manifest["name"] == "web"
+    assert [repo["name"] for repo in manifest["repos"]] == ["monorepo"]
+    assert manifest["repos"][0]["path"] == "../.."
+
+
 def test_discover_projects_in_parent_folder(tmp_path):
     root = tmp_path / "workspace"
     _git_init(root / "alpha", "https://github.com/org/alpha.git")

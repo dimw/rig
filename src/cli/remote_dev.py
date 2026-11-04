@@ -3496,9 +3496,9 @@ def discover_git_projects(directory: str) -> List[Dict[str, str]]:
 def resolve_init_context(start: Optional[str] = None) -> Dict[str, Any]:
     """Choose the folder that should become the environment and its projects.
 
-    If start is inside a git repo, the environment config lives in that repo
-    (so it can be committed). Sibling git projects in the parent folder are
-    still offered for inclusion. Outside a git repo, scan start itself.
+    The environment root is always ``start`` (cwd), including when that path is
+    a subdirectory of a git repo. Nearby sibling git projects are still offered
+    for inclusion. Outside a git repo, scan start itself.
     """
     start = os.path.abspath(start or os.getcwd())
     git_root = _git_root(start)
@@ -3510,7 +3510,7 @@ def resolve_init_context(start: Optional[str] = None) -> Dict[str, Any]:
         ]
         projects = siblings or discover_git_projects(git_root)
         return {
-            "root": git_root,
+            "root": start,
             "projects": projects,
             "current": git_root,
             "in_git_repo": True,

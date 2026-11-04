@@ -50,7 +50,7 @@ Chosen at `rig init` (`editor` in `rig.yml`), or override with `--editor`. Local
 
 ## Layout
 
-`rig init` writes commit-friendly files into the current git project:
+`rig init` writes commit-friendly files into the current directory (including a subdirectory of a git repo):
 
 ```text
 rig.yml                 # workspace manifest (vm, agent, playbooks, repos)
