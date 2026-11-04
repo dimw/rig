@@ -1,0 +1,317 @@
+"""
+Git module for workspace project management
+
+This module provides functionality for:
+- Cloning git repositories on remote development environments
+- Managing git configurations
+- Handling authentication with PAT and SSH keys
+"""
+
+import os
+import subprocess
+from typing import Dict, List, Optional, TYPE_CHECKING
+import yaml
+
+if TYPE_CHECKING:
+    from cli.remote_dev import ProjectConfig
+
+
+class GitManager:
+    """Manages git operations for workspace projects"""
+
+    def __init__(self, project_config: Optional["ProjectConfig"] = None):
+        self.project_config = project_config
+        self.repos_to_clone: List[Dict] = []
+        self.ssh_repos: List[Dict] = []
+        self.git_config: Dict = {}
+
+    def load_git_config(self, config_path: Optional[str] = None) -> bool:
+        """Load git configuration from vars.yml"""
+        try:
+            if self.project_config is None:
+                return False
+            
+            self.project_config.load()
+            git_config = self.project_config.get_vars('git')
+            
+            if git_config:
+                self.git_config = git_config
+                self.repos_to_clone = git_config.get('clone_repos', [])
+                self.ssh_repos = git_config.get('ssh_repos', [])
+                return True
+            
+            return False
+        except Exception as e:
+            print(f"Warning: Could not load git config: {e}")
+            return False
+
+    def get_repos_to_clone(self) -> List[Dict]:
+        """Get list of repositories to clone"""
+        return self.repos_to_clone + self.ssh_repos
+
+    def generate_clone_tasks(self) -> List[Dict]:
+        """Generate Ansible tasks for cloning repositories"""
+        tasks = []
+        
+        # Add SSH known hosts setup for public repos
+        for repo in self.repos_to_clone:
+            repo_url = repo.get('repo', '')
+            if repo_url.startswith('https://') or repo_url.startswith('http://'):
+                tasks.append({
+                    'name': f'Add {self._get_hostname(repo_url)} SSH known hosts',
+                    'shell': f'ssh-keyscan {self._get_hostname(repo_url)} >> ~/.ssh/known_hosts 2>/dev/null || true',
+                    'changed_when': False,
+                    'ignore_errors': True
+                })
+                break  # Only add once
+        
+        # Add clone tasks for public repos
+        for repo in self.repos_to_clone:
+            tasks.append({
+                'name': f'Clone {self._get_repo_name(repo.get("repo", ""))}',
+                'git': {
+                    'repo': repo.get('repo'),
+                    'dest': repo.get('dest'),
+                    'accept_hostkey': repo.get('accept_hostkey', True),
+                    'force': repo.get('force', False),
+                    'version': repo.get('version', 'main')
+                }
+            })
+        
+        # Add clone tasks for SSH repos
+        for repo in self.ssh_repos:
+            tasks.append({
+                'name': f'Clone {self._get_repo_name(repo.get("repo", ""))} (SSH)',
+                'git': {
+                    'repo': repo.get('repo'),
+                    'dest': repo.get('dest'),
+                    'accept_hostkey': repo.get('accept_hostkey', True),
+                    'force': repo.get('force', False),
+                    'version': repo.get('version', 'main'),
+                    'ssh_key': repo.get('ssh_key', '/root/.ssh/id_rsa')
+                }
+            })
+        
+        return tasks
+
+    def _get_hostname(self, repo_url: str) -> str:
+        """Extract hostname from repository URL"""
+        if repo_url.startswith('https://') or repo_url.startswith('http://'):
+            return repo_url.split('/')[2]
+        if repo_url.startswith('git@'):
+            # git@host:owner/repo.git → host
+            return repo_url[len('git@'):].split(':', 1)[0] or 'github.com'
+        return 'github.com'
+
+    def _get_repo_name(self, repo_url: str) -> str:
+        """Extract repository name from URL"""
+        # Remove .git suffix
+        name = repo_url.rstrip('/')
+        if name.endswith('.git'):
+            name = name[:-4]
+        
+        # Get last part of URL
+        if '/' in name:
+            return name.split('/')[-1]
+        return name
+
+    def setup_git_environment(self, project_dir: str) -> bool:
+        """Set up git environment for a project"""
+        try:
+            # Ensure .rig directory exists
+            rig_dir = os.path.join(project_dir, '.rig')
+            if not os.path.exists(rig_dir):
+                os.makedirs(rig_dir)
+            
+            # Load existing config if available
+            if self.project_config is None:
+                from cli.remote_dev import ProjectConfig
+                self.project_config = ProjectConfig(project_dir)
+            
+            self.project_config.load()
+            
+            # Set default git configuration if not present
+            if not self.project_config.get_vars('git'):
+                self.project_config.set_vars('git.clone_repos', [])
+                self.project_config.set_vars('git.ssh_repos', [])
+            
+            return True
+        except Exception as e:
+            print(f"Error setting up git environment: {e}")
+            return False
+
+    def add_repo(
+        self,
+        repo_url: str,
+        dest: str,
+        is_ssh: bool = False,
+        password_var: Optional[str] = None,
+    ) -> bool:
+        """Add a repository to the clone list"""
+        try:
+            if self.project_config is None:
+                from cli.remote_dev import ProjectConfig
+                self.project_config = ProjectConfig()
+            
+            self.project_config.load()
+            
+            git_config = self.project_config.get_vars('git') or {}
+            clone_repos = git_config.get('clone_repos', [])
+            ssh_repos = git_config.get('ssh_repos', [])
+            
+            repo_config = {
+                'repo': repo_url,
+                'dest': dest,
+                'accept_hostkey': True
+            }
+            if password_var:
+                repo_config['password_var'] = password_var
+            
+            if is_ssh:
+                repo_config['ssh_key'] = '/root/.ssh/id_rsa'
+                ssh_repos.append(repo_config)
+            else:
+                clone_repos.append(repo_config)
+            
+            git_config['clone_repos'] = clone_repos
+            git_config['ssh_repos'] = ssh_repos
+            
+            self.project_config.set_vars('git', git_config)
+            self.project_config.save(write_vars=False)
+            
+            # Update internal state
+            self.repos_to_clone = clone_repos
+            self.ssh_repos = ssh_repos
+            
+            return True
+        except Exception as e:
+            print(f"Error adding repository: {e}")
+            return False
+
+    def set_repo_password_var(self, repo_url: str, password_var: str) -> bool:
+        """Attach or update password_var on an existing clone_repos entry."""
+        try:
+            if self.project_config is None:
+                from cli.remote_dev import ProjectConfig
+                self.project_config = ProjectConfig()
+
+            self.project_config.load()
+            git_config = self.project_config.get_vars('git') or {}
+            clone_repos = git_config.get('clone_repos', [])
+            updated = False
+            for item in clone_repos:
+                if isinstance(item, dict) and item.get('repo') == repo_url:
+                    item['password_var'] = password_var
+                    updated = True
+            if not updated:
+                return False
+            git_config['clone_repos'] = clone_repos
+            self.project_config.set_vars('git', git_config)
+            self.project_config.save(write_vars=False)
+            self.repos_to_clone = clone_repos
+            return True
+        except Exception as e:
+            print(f"Error setting password_var: {e}")
+            return False
+
+    def set_repo_dest(self, repo_url: str, dest: str) -> bool:
+        """Update dest on an existing clone_repos / ssh_repos entry."""
+        try:
+            if self.project_config is None:
+                from cli.remote_dev import ProjectConfig
+                self.project_config = ProjectConfig()
+
+            self.project_config.load()
+            git_config = self.project_config.get_vars('git') or {}
+            updated = False
+            for key in ('clone_repos', 'ssh_repos'):
+                entries = git_config.get(key, []) or []
+                for item in entries:
+                    if isinstance(item, dict) and item.get('repo') == repo_url:
+                        if item.get('dest') != dest:
+                            item['dest'] = dest
+                            updated = True
+                git_config[key] = entries
+            if not updated:
+                return False
+            self.project_config.set_vars('git', git_config)
+            self.project_config.save(write_vars=False)
+            self.repos_to_clone = git_config.get('clone_repos', [])
+            self.ssh_repos = git_config.get('ssh_repos', [])
+            return True
+        except Exception as e:
+            print(f"Error setting repo dest: {e}")
+            return False
+
+    def normalize_workspace_dests(self) -> int:
+        """
+        Rewrite legacy ``/root/<name>`` clone destinations under ``/workspace``.
+
+        Returns the number of entries updated.
+        """
+        from cli.remote_dev import REMOTE_WORKSPACE_ROOT, remote_workspace_path
+
+        try:
+            if self.project_config is None:
+                return 0
+            self.project_config.load()
+            git_config = self.project_config.get_vars('git') or {}
+            changed = 0
+            for key in ('clone_repos', 'ssh_repos'):
+                entries = git_config.get(key, []) or []
+                for item in entries:
+                    if not isinstance(item, dict):
+                        continue
+                    dest = str(item.get('dest') or '')
+                    if not dest:
+                        continue
+                    # Legacy home clones → workspace; leave /root/.ssh alone.
+                    if dest.startswith('/root/') and not dest.startswith('/root/.'):
+                        name = dest.rstrip('/').split('/')[-1]
+                        item['dest'] = remote_workspace_path(name)
+                        changed += 1
+                    elif not dest.startswith(REMOTE_WORKSPACE_ROOT + '/') and dest != REMOTE_WORKSPACE_ROOT:
+                        # Keep absolute paths outside /root as-is (custom mounts).
+                        pass
+                git_config[key] = entries
+            if changed:
+                self.project_config.set_vars('git', git_config)
+                self.project_config.save(write_vars=False)
+                self.repos_to_clone = git_config.get('clone_repos', [])
+                self.ssh_repos = git_config.get('ssh_repos', [])
+            return changed
+        except Exception as e:
+            print(f"Error normalizing workspace dests: {e}")
+            return 0
+
+    def remove_repo(self, repo_url: str) -> bool:
+        """Remove a repository from the clone list"""
+        try:
+            if self.project_config is None:
+                from cli.remote_dev import ProjectConfig
+                self.project_config = ProjectConfig()
+            
+            self.project_config.load()
+            
+            git_config = self.project_config.get_vars('git') or {}
+            clone_repos = git_config.get('clone_repos', [])
+            ssh_repos = git_config.get('ssh_repos', [])
+            
+            # Remove matching repos
+            clone_repos = [r for r in clone_repos if r.get('repo') != repo_url]
+            ssh_repos = [r for r in ssh_repos if r.get('repo') != repo_url]
+            
+            git_config['clone_repos'] = clone_repos
+            git_config['ssh_repos'] = ssh_repos
+            
+            self.project_config.set_vars('git', git_config)
+            self.project_config.save()
+            
+            # Update internal state
+            self.repos_to_clone = clone_repos
+            self.ssh_repos = ssh_repos
+            
+            return True
+        except Exception as e:
+            print(f"Error removing repository: {e}")
+            return False
