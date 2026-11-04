@@ -1373,6 +1373,39 @@ class RemoteDevEnvironment:
         except Exception as exc:
             log.debug("Could not normalize clone destinations: %s", exc)
 
+        # HTTPS clones without a PAT hang on an interactive credential prompt.
+        try:
+            git_cfg = project.get_vars("git") or {}
+            clones = git_cfg.get("clone_repos") or []
+            has_github_pat = bool(project.get_vars("github_pat"))
+            has_gitlab_pat = bool(project.get_vars("gitlab_pat"))
+            missing = []
+            for item in clones:
+                if not isinstance(item, dict):
+                    continue
+                repo = str(item.get("repo") or "")
+                if not repo.startswith("https://"):
+                    continue
+                pat_var = item.get("password_var") or ""
+                if pat_var and project.get_vars(str(pat_var)):
+                    continue
+                if "gitlab.com" in repo and has_gitlab_pat:
+                    continue
+                if "gitlab.com" not in repo and has_github_pat:
+                    continue
+                missing.append(item.get("dest") or repo)
+            if missing and "workspace" in wanted:
+                log.warning(
+                    "HTTPS clone(s) have no PAT (%s). "
+                    "Private repos will fail auth. Store one with: "
+                    "rig vars encrypt github_pat  "
+                    "(then set password_var on each git.clone_repos entry, "
+                    "or rely on github_pat / gitlab_pat fallback)",
+                    ", ".join(str(m) for m in missing),
+                )
+        except Exception as exc:
+            log.debug("Could not preflight git clone credentials: %s", exc)
+
         ansible = AnsibleManager(project)
         if not ansible.configure(project_dir):
             return False
@@ -2843,9 +2876,19 @@ WORKSPACE_PLAYBOOK = """---
     - name: Clone configured git repositories
       vars:
         _pat_var: "{{ item.password_var | default('') }}"
-        _pat: "{{ lookup('vars', _pat_var, default='') if _pat_var else '' }}"
+        # Fall back to provider default vault vars when password_var was skipped at init.
+        _provider_pat: >-
+          {{ (gitlab_pat | default(''))
+             if ('gitlab.com' in (item.repo | default('')))
+             else (github_pat | default('')) }}
+        _pat: >-
+          {{ (lookup('vars', _pat_var, default='') if _pat_var else '')
+             or _provider_pat }}
         # GitHub expects x-access-token; GitLab expects oauth2.
         _auth_user: "{{ 'oauth2' if ('gitlab.com' in item.repo) else 'x-access-token' }}"
+      environment:
+        # Never hang on an interactive username/password prompt (missing PAT).
+        GIT_TERMINAL_PROMPT: "0"
       git:
         repo: >-
           {{ item.repo
