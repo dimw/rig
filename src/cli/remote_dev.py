@@ -4,6 +4,7 @@ Remote Development Environment Module
 import json
 import os
 import re
+import sys
 import uuid
 import time
 import shutil
@@ -37,6 +38,71 @@ except ImportError:
 
 # Project files live here on the VM — separate from /root home (dotfiles, caches).
 REMOTE_WORKSPACE_ROOT = "/workspace"
+
+# Local editor CLIs for ``rig dev`` (Remote-SSH). Prefer ``editor`` in rig.yml
+# or ``--editor``; otherwise the first available binary wins.
+SUPPORTED_EDITORS = ("code", "code-insiders", "cursor", "codium")
+EDITOR_LABELS = {
+    "code": "VS Code",
+    "code-insiders": "VS Code Insiders",
+    "cursor": "Cursor",
+    "codium": "VSCodium",
+}
+DEFAULT_EDITOR = "code"
+
+
+def normalize_editor_type(value: Optional[str]) -> str:
+    """Normalize a rig.yml / CLI editor preference."""
+    raw = (value or "").strip().lower().replace(" ", "-").replace("_", "-")
+    aliases = {
+        "code": "code",
+        "vscode": "code",
+        "vs-code": "code",
+        "code-insiders": "code-insiders",
+        "insiders": "code-insiders",
+        "cursor": "cursor",
+        "codium": "codium",
+        "vscodium": "codium",
+    }
+    editor = aliases.get(raw, raw)
+    if editor not in SUPPORTED_EDITORS:
+        raise ValueError(
+            f"Unsupported editor {value!r}. "
+            f"Choose one of: {', '.join(SUPPORTED_EDITORS)}"
+        )
+    return editor
+
+
+def prompt_editor(
+    default: str = DEFAULT_EDITOR,
+    input_fn=None,
+) -> str:
+    """Ask which local editor CLI to prefer for ``rig dev``."""
+    ask = input_fn or input
+    try:
+        default = normalize_editor_type(default)
+    except ValueError:
+        default = DEFAULT_EDITOR
+    choices = ", ".join(f"{e} ({EDITOR_LABELS[e]})" for e in SUPPORTED_EDITORS)
+    answer = ask(f"Editor [{choices}] [{default}]: ").strip()
+    if not answer:
+        return default
+    return normalize_editor_type(answer)
+
+
+def project_editor_preference(project_dir: Optional[str] = None) -> Optional[str]:
+    """Return ``editor`` from ``rig.yml`` when set, else None (auto-detect)."""
+    project = ProjectConfig(os.path.abspath(project_dir or os.getcwd()))
+    if not project.load() or not project.config:
+        return None
+    raw = project.config.get("editor")
+    if raw is None or raw == "":
+        return None
+    try:
+        return normalize_editor_type(str(raw))
+    except ValueError:
+        log.warning("Ignoring invalid editor %r in rig.yml", raw)
+        return None
 
 # Paths written under the project by Galaxy / create that should not be committed.
 GITIGNORE_MARKER_BEGIN = "# >>> rig managed"
@@ -1899,7 +1965,6 @@ echo "Agent installation complete!"
             return False
 
     @staticmethod
-    @staticmethod
     def agent_remote_command(
         agent_type: str = "opencode",
         extra_args: Optional[List[str]] = None,
@@ -1924,6 +1989,15 @@ echo "Agent installation complete!"
                 f"mkdir -p {REMOTE_WORKSPACE_ROOT} && "
                 f"cd {REMOTE_WORKSPACE_ROOT} && exec claude{suffix}"
             )
+        if agent == "cursor":
+            return (
+                'export PATH="$HOME/.local/bin:$PATH"; '
+                "set -a; "
+                "[ -f /root/.cursor/credentials.env ] && . /root/.cursor/credentials.env; "
+                "set +a; "
+                f"mkdir -p {REMOTE_WORKSPACE_ROOT} && "
+                f"cd {REMOTE_WORKSPACE_ROOT} && exec agent{suffix}"
+            )
         return (
             'export PATH="$HOME/.opencode/bin:/usr/local/bin:$PATH"; '
             "set -a; "
@@ -1943,8 +2017,12 @@ echo "Agent installation complete!"
         """
         Open an interactive SSH TTY to the coding agent on the remote VM.
 
-        ``agent_args`` are appended to the remote ``opencode`` / ``claude``
-        invocation (e.g. ``--continue`` to resume the last session).
+        ``agent_args`` are appended to the remote ``opencode`` / ``claude`` /
+        ``agent`` (Cursor) invocation (e.g. ``--continue`` to resume).
+
+        After the agent exits, captures a printed session / resume id (when
+        present) under ``/tmp/.rig/sessions/<env>`` so a later bare
+        ``rig attach`` can reopen the same session.
 
         Returns the SSH process exit code (0 on success).
         """
@@ -1982,15 +2060,73 @@ echo "Agent installation complete!"
         log.debug("SSH key=%s", ssh_key_path)
         log.debug("Remote command=%s", remote_cmd)
 
+        from cli.last_session import (
+            extract_session_from_agent_args,
+            parse_session_id,
+            remember_last_session,
+        )
+
+        attach_log = os.path.join("/tmp/.rig", f"attach-{self.name}.log")
         try:
-            completed = subprocess.run(ssh_cmd)
-            return int(completed.returncode or 0)
+            os.makedirs("/tmp/.rig", mode=0o700, exist_ok=True)
+        except OSError:
+            pass
+
+        exit_code = 1
+        try:
+            exit_code = self._run_attach_ssh(ssh_cmd, attach_log)
         except FileNotFoundError:
             log.error("ssh client not found on PATH")
             return 1
         except KeyboardInterrupt:
             log.info("Detached from agent session")
-            return 130
+            exit_code = 130
+
+        session_id = extract_session_from_agent_args(agent_args)
+        if not session_id:
+            try:
+                with open(attach_log, "r", encoding="utf-8", errors="replace") as handle:
+                    session_id = parse_session_id(handle.read())
+            except OSError:
+                session_id = None
+        if session_id:
+            remember_last_session(self.name, session_id, agent_type=str(agent_type))
+            log.info("Remembered agent session %s for '%s'", session_id, self.name)
+            log.debug("Resume later with: rig attach  (or --resume/--session %s)", session_id)
+        return int(exit_code)
+
+    @staticmethod
+    def _run_attach_ssh(ssh_cmd: List[str], attach_log: str) -> int:
+        """
+        Run interactive SSH, preferably under ``script`` so exit banners are
+        captured while the TTY stays usable.
+        """
+        script_bin = shutil.which("script")
+        if script_bin:
+            try:
+                if sys.platform == "darwin":
+                    # BSD script: script [-q] [file] command...
+                    completed = subprocess.run(
+                        [script_bin, "-q", attach_log, *ssh_cmd]
+                    )
+                else:
+                    # util-linux: script -q -c 'cmd' file
+                    completed = subprocess.run(
+                        [
+                            script_bin,
+                            "-q",
+                            "-c",
+                            " ".join(shlex.quote(part) for part in ssh_cmd),
+                            attach_log,
+                        ]
+                    )
+                return int(completed.returncode or 0)
+            except FileNotFoundError:
+                pass
+
+        # Fallback: no session capture without a typescript helper.
+        completed = subprocess.run(ssh_cmd)
+        return int(completed.returncode or 0)
 
     def ssh_host_alias(self) -> str:
         """SSH config Host alias used by VS Code / Cursor Remote-SSH."""
@@ -2590,6 +2726,74 @@ SYSTEM_PLAYBOOK = r"""---
         - coding_agent_api_key is defined
         - coding_agent_api_key | length > 0
 
+    # --- Coding agent: Cursor CLI (`agent`) ---
+    # Do not use creates= alone: verify the binary actually runs.
+    - name: Install Cursor CLI
+      shell: |
+        set -euo pipefail
+        bin=/root/.local/bin/agent
+        if [ -x "$bin" ] && [ -s "$bin" ] && "$bin" --version >/dev/null 2>&1; then
+          exit 0
+        fi
+        curl -fsSL https://cursor.com/install | bash
+        test -s "$bin"
+        test -x "$bin"
+        "$bin" --version
+      args:
+        executable: /bin/bash
+      environment:
+        HOME: /root
+      when: coding_agent_type == "cursor"
+
+    - name: Ensure Cursor local bin is on PATH
+      lineinfile:
+        path: /root/.bashrc
+        line: 'export PATH="$HOME/.local/bin:$PATH"'
+        create: true
+      when: coding_agent_type == "cursor"
+
+    - name: Symlink Cursor agent onto PATH
+      file:
+        src: /root/.local/bin/agent
+        dest: /usr/local/bin/agent
+        state: link
+        force: true
+      when: coding_agent_type == "cursor"
+
+    - name: Ensure Cursor config directory exists
+      file:
+        path: /root/.cursor
+        state: directory
+        mode: "0700"
+      when: coding_agent_type == "cursor"
+
+    - name: Deploy Cursor CLI config from .rig/.cursor
+      copy:
+        src: "{{ playbook_dir }}/.cursor/cli-config.json"
+        dest: /root/.cursor/cli-config.json
+        mode: "0600"
+      when: coding_agent_type == "cursor"
+
+    - name: Deploy Cursor MCP config from .rig/.cursor
+      copy:
+        src: "{{ playbook_dir }}/.cursor/mcp.json"
+        dest: /root/.cursor/mcp.json
+        mode: "0600"
+      when: coding_agent_type == "cursor"
+
+    - name: Write Cursor credentials env file
+      copy:
+        dest: /root/.cursor/credentials.env
+        mode: "0600"
+        content: |
+          CODING_AGENT_API_KEY={{ coding_agent_api_key }}
+          CURSOR_API_KEY={{ coding_agent_api_key }}
+      no_log: true
+      when:
+        - coding_agent_type == "cursor"
+        - coding_agent_api_key is defined
+        - coding_agent_api_key | length > 0
+
     - name: Install coding-agent profile.d env exports
       copy:
         dest: /etc/profile.d/rig-coding-agent.sh
@@ -2606,6 +2810,12 @@ SYSTEM_PLAYBOOK = r"""---
             set -a
             # shellcheck disable=SC1091
             . /root/.claude/credentials.env
+            set +a
+          fi
+          if [ -f /root/.cursor/credentials.env ]; then
+            set -a
+            # shellcheck disable=SC1091
+            . /root/.cursor/credentials.env
             set +a
           fi
       when: coding_agent_api_key is defined and coding_agent_api_key | length > 0
@@ -2741,6 +2951,8 @@ class ProjectConfig:
                 "vscode": True,
                 "credentials_var": "coding_agent_api_key",
             },
+            # Preferred local CLI for ``rig dev`` (Remote-SSH).
+            "editor": DEFAULT_EDITOR,
             "playbooks": {
                 "system": f"{self.RIG_DIR}/{self.SYSTEM_YAML}",
                 "workspace": f"{self.RIG_DIR}/{self.WORKSPACE_YAML}",
@@ -3366,6 +3578,7 @@ class Workspace:
         repos: Optional[List[Dict[str, str]]] = None,
         password_vars: Optional[Dict[str, str]] = None,
         agent_type: Optional[str] = None,
+        editor: Optional[str] = None,
     ) -> bool:
         """Idempotently initialize workspace config and register selected repos."""
         workspace_name = name or os.path.basename(self.path.rstrip(os.sep)) or "workspace"
@@ -3377,6 +3590,10 @@ class Workspace:
         password_vars = password_vars or {}
         from cli.agents import normalize_agent_type
         chosen_agent = normalize_agent_type(agent_type or "opencode")
+        try:
+            chosen_editor = normalize_editor_type(editor or DEFAULT_EDITOR)
+        except ValueError:
+            chosen_editor = DEFAULT_EDITOR
 
         project = ProjectConfig(self.path)
         # Pass agent_type into init so scaffold/config persist before add_repo reloads.
@@ -3392,6 +3609,7 @@ class Workspace:
         project.config.setdefault("agent", {})
         project.config["agent"]["type"] = chosen_agent
         project.config["agent"]["credentials_var"] = "coding_agent_api_key"
+        project.config["editor"] = chosen_editor
         project.set_vars("coding_agent_type", chosen_agent)
 
         existing_repos = [
@@ -3468,10 +3686,11 @@ class Workspace:
         project.set_vars("git_providers", providers)
         project.config["repos"] = list(by_name.values())
         project.config["git_providers"] = providers
-        # Re-apply after add_repo/load cycles so agent choice is not lost.
+        # Re-apply after add_repo/load cycles so agent/editor choice is not lost.
         project.config.setdefault("agent", {})
         project.config["agent"]["type"] = chosen_agent
         project.config["agent"]["credentials_var"] = "coding_agent_api_key"
+        project.config["editor"] = chosen_editor
         project.set_vars("coding_agent_type", chosen_agent)
 
         if not project.save(write_vars=False):
@@ -3486,6 +3705,7 @@ class Workspace:
         if providers:
             print("Git providers: " + ", ".join(providers))
         print(f"Coding agent: {chosen_agent}")
+        print(f"Editor: {chosen_editor}")
         return True
 
 
@@ -3575,6 +3795,13 @@ def interactive_env_init(
         print(f"Error: {exc}")
         return False
 
+    existing_editor = existing.get("editor") or DEFAULT_EDITOR
+    try:
+        editor = prompt_editor(default=str(existing_editor), input_fn=input_fn)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return False
+
     # Collect PATs before writing config so password_var can be attached on add.
     pat_assignments, default_pats = collect_repo_pats(
         selected,
@@ -3592,6 +3819,7 @@ def interactive_env_init(
         repos=selected,
         password_vars=password_vars,
         agent_type=agent_type,
+        editor=editor,
     ):
         return False
 

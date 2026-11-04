@@ -161,6 +161,55 @@ def test_dev_cli_uses_last_env_and_opens_vscode():
         assert kwargs.get("remote_path") == "/workspace"
 
 
+def test_normalize_and_project_editor_preference(tmp_path):
+    from cli.remote_dev import (
+        ProjectConfig,
+        normalize_editor_type,
+        project_editor_preference,
+    )
+
+    assert normalize_editor_type("Cursor") == "cursor"
+    assert normalize_editor_type("vscode") == "code"
+    with pytest.raises(ValueError):
+        normalize_editor_type("notepad")
+
+    assert project_editor_preference(str(tmp_path)) is None
+    cfg = ProjectConfig(str(tmp_path))
+    assert cfg.init(name="ws", agent_type="opencode")
+    assert project_editor_preference(str(tmp_path)) == "code"
+    cfg.load()
+    cfg.config["editor"] = "cursor"
+    cfg.save(write_vars=False)
+    assert project_editor_preference(str(tmp_path)) == "cursor"
+
+
+def test_dev_cli_prefers_flag_over_rig_yml(tmp_path):
+    with patch("cli.main._load_credentials"), patch.dict(
+        os.environ, {"HETZNER_CLOUD_API_TOKEN": "tok"}, clear=False
+    ), patch("cli.main.StorageManager", side_effect=ValueError("no storage")), patch(
+        "cli.main.resolve_env_name", return_value="dev-ed"
+    ), patch("cli.main.RemoteDevEnvironment") as env_cls, patch(
+        "cli.main.remember_last_env"
+    ), patch(
+        "cli.remote_dev.project_editor_preference", return_value="cursor"
+    ) as pref:
+        instance = MagicMock()
+        instance.name = "dev-ed"
+        instance.vm_ip = "10.0.0.9"
+        instance.resolve_resources.return_value = True
+        instance.open_vscode.return_value = 0
+        env_cls.return_value = instance
+
+        assert main(["dev", "--editor", "codium"]) == 0
+        pref.assert_not_called()
+        assert instance.open_vscode.call_args.kwargs.get("editor") == "codium"
+
+        instance.open_vscode.reset_mock()
+        assert main(["dev"]) == 0
+        pref.assert_called()
+        assert instance.open_vscode.call_args.kwargs.get("editor") == "cursor"
+
+
 def test_dev_requires_name_when_no_last_env(capsys):
     with patch("cli.main._load_credentials"), patch.dict(
         os.environ, {"HETZNER_CLOUD_API_TOKEN": "tok"}, clear=False

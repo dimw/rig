@@ -586,8 +586,9 @@ def prompt_and_store_coding_agent_credentials(
     Ask for the remote coding agent API key, encrypt it, and store it as
     coding_agent_api_key in .rig/vars.yml for system.yml to consume.
 
-    Config files under ``.rig/.opencode`` / ``.rig/.claude`` reference the key
-    via the ``CODING_AGENT_API_KEY`` environment variable set on the VM.
+    Config files under ``.rig/.opencode`` / ``.rig/.claude`` / ``.rig/.cursor``
+    reference the key via env vars set on the VM (``CODING_AGENT_API_KEY``,
+    and ``CURSOR_API_KEY`` / ``ANTHROPIC_API_KEY`` as needed).
     """
     label = "Coding agent API key"
     if agent_type:
@@ -605,7 +606,12 @@ def prompt_and_store_coding_agent_credentials(
             agent_normalized = normalize_agent_type(agent_type)
         except ValueError:
             agent_normalized = None
-    skip_hint = " [Enter = OpenCode free models]" if agent_normalized == "opencode" else ""
+    if agent_normalized == "opencode":
+        skip_hint = " [Enter = OpenCode free models]"
+    elif agent_normalized == "cursor":
+        skip_hint = " [Enter = skip; Cursor CLI needs CURSOR_API_KEY on the VM]"
+    else:
+        skip_hint = ""
     api_key = _prompt_secret_with_env_fallback(
         f"{label}{skip_hint}",
         "RIG_CODING_AGENT_API_KEY",
@@ -617,6 +623,11 @@ def prompt_and_store_coding_agent_credentials(
             print(
                 "Skipping coding_agent_api_key (no key provided); "
                 "OpenCode will use free models"
+            )
+        elif agent_normalized == "cursor":
+            print(
+                "Skipping coding_agent_api_key (no key provided); "
+                "set a Cursor user API key before rig attach"
             )
         else:
             print("Skipping coding_agent_api_key (no key provided)")

@@ -15,6 +15,12 @@ from cli.config import RigConfig
 from cli.encrypt import interactive_decrypt, interactive_encrypt
 from cli import log as log
 from cli.last_env import clear_last_env, remember_last_env, resolve_env_name
+from cli.last_session import (
+    agent_args_request_session,
+    clear_last_session,
+    read_last_session,
+    resume_args_for_agent,
+)
 from cli.remote_dev import (
     REMOTE_WORKSPACE_ROOT,
     ProjectConfig,
@@ -198,12 +204,38 @@ def _cmd_attach(args: argparse.Namespace) -> int:
             log.error("Re-run create on this machine, or restore the key before attaching")
             return 1
 
+        project = ProjectConfig(os.getcwd())
+        project.load()
+        agent_type = (
+            (project.config.get("agent") or {}).get("type")
+            or project.get_vars("coding_agent_type")
+            or "opencode"
+        )
+
+        # Bare ``rig attach`` reopens the last remembered session when present.
+        if not agent_args_request_session(agent_args):
+            stored = read_last_session(env.name)
+            if stored:
+                session_id, stored_agent = stored
+                resume_agent = stored_agent or agent_type
+                injected = resume_args_for_agent(resume_agent, session_id)
+                agent_args = injected + list(agent_args)
+                log.info(
+                    "Resuming last %s session %s",
+                    resume_agent,
+                    session_id,
+                )
+
         env.ensure_firewall_access(project_dir=os.getcwd())
         remember_last_env(env.name)
         log.info("Attaching to '%s' (%s)", env.name, env.vm_ip)
         if agent_args:
             log.debug("Agent args: %s", " ".join(agent_args))
-        return env.attach_to_agent(project_dir=os.getcwd(), agent_args=agent_args)
+        return env.attach_to_agent(
+            project_dir=os.getcwd(),
+            agent_type=str(agent_type),
+            agent_args=agent_args,
+        )
     except Exception as e:
         log.error("Error attaching to environment: %s", e)
         return 1
@@ -291,11 +323,15 @@ def _cmd_dev(args: argparse.Namespace) -> int:
 
         env.ensure_firewall_access(project_dir=os.getcwd())
         remember_last_env(env.name)
+        editor = getattr(args, "editor", None)
+        if not editor:
+            from cli.remote_dev import project_editor_preference
+            editor = project_editor_preference(os.getcwd())
         return env.open_vscode(
             remote_path=getattr(args, "path", None) or REMOTE_WORKSPACE_ROOT,
             project_dir=os.getcwd(),
             browser=bool(getattr(args, "browser", False)),
-            editor=getattr(args, "editor", None),
+            editor=editor,
         )
     except Exception as e:
         log.error("Error opening VS Code: %s", e)
@@ -371,6 +407,7 @@ def _cmd_destroy(args: argparse.Namespace) -> int:
             env = RemoteDevEnvironment(name=name, storage_manager=storage_manager)
             env.cleanup(project_dir=os.getcwd())
             clear_last_env(name)
+            clear_last_session(name)
             log.info("Environment '%s' destroyed", name)
         except Exception as e:
             log.error("Error destroying environment '%s': %s", name, e)
@@ -559,7 +596,10 @@ def main(argv=None):
 
     attach_parser = subparsers.add_parser(
         "attach",
-        help="Attach to a remote coding-agent TTY (uses last env if name omitted)",
+        help=(
+            "Attach to a remote coding-agent TTY (uses last env if name omitted; "
+            "reopens the last remembered agent session when no --resume/--session/-c)"
+        ),
     )
     attach_parser.add_argument(
         "name",
@@ -591,12 +631,12 @@ def main(argv=None):
         nargs="?",
         const="",
         metavar="ID",
-        help="Resume a Claude Code session (forwards --resume [ID])",
+        help="Resume a Claude Code / Cursor session (forwards --resume [ID])",
     )
     attach_parser.add_argument(
         "agent_args",
         nargs=argparse.REMAINDER,
-        help="Extra args forwarded to opencode/claude (put -- before flags)",
+        help="Extra args forwarded to opencode/claude/agent (put -- before flags)",
     )
 
     dev_parser = subparsers.add_parser(
@@ -630,7 +670,7 @@ def main(argv=None):
     dev_parser.add_argument(
         "--editor",
         choices=["code", "code-insiders", "cursor", "codium"],
-        help="Prefer a specific local editor CLI",
+        help="Prefer a specific local editor CLI (overrides editor in rig.yml)",
     )
 
     subparsers.add_parser("list", help="List remote environments")

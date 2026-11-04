@@ -19,6 +19,7 @@ from cli.agents import (
 def test_normalize_agent_aliases():
     assert normalize_agent_type("Claude Code") == "claude"
     assert normalize_agent_type("opencode") == "opencode"
+    assert normalize_agent_type("cursor-cli") == "cursor"
 
 
 def test_opencode_config_defaults_to_free_without_api_key():
@@ -64,6 +65,16 @@ def test_ensure_agent_scaffold_claude(tmp_path):
     assert "Workspace rules" in (rig / "AGENTS.md").read_text()
 
 
+def test_ensure_agent_scaffold_cursor(tmp_path):
+    rig = tmp_path / ".rig"
+    rig.mkdir()
+    ensure_agent_scaffold(str(rig), agent_type="cursor")
+    assert (rig / ".cursor" / "cli-config.json").is_file()
+    assert (rig / ".cursor" / "mcp.json").is_file()
+    assert "Workspace rules" in (rig / "AGENTS.md").read_text()
+
+
 def test_prompt_coding_agent_default():
     assert prompt_coding_agent(default="opencode", input_fn=lambda _p: "") == "opencode"
     assert prompt_coding_agent(default="opencode", input_fn=lambda _p: "claude") == "claude"
+    assert prompt_coding_agent(default="opencode", input_fn=lambda _p: "cursor") == "cursor"

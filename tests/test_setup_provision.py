@@ -12,7 +12,7 @@ from cli.main import main
 from cli.remote_dev import AnsibleManager, ProjectConfig, RemoteDevEnvironment
 
 
-def test_agent_remote_command_opencode_and_claude():
+def test_agent_remote_command_opencode_claude_and_cursor():
     opencode = RemoteDevEnvironment.agent_remote_command("opencode")
     assert "opencode" in opencode
     assert "credentials.env" in opencode
@@ -23,6 +23,11 @@ def test_agent_remote_command_opencode_and_claude():
     assert "claude" in claude
     assert ".local/bin" in claude
     assert "mkdir -p /workspace" in claude
+
+    cursor = RemoteDevEnvironment.agent_remote_command("cursor")
+    assert "exec agent" in cursor
+    assert "/root/.cursor/credentials.env" in cursor
+    assert "mkdir -p /workspace" in cursor
 
 
 def test_provision_requires_rig_yml(tmp_path):

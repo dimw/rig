@@ -3,7 +3,7 @@
 
 # rig
 
-Fast, cost-efficient ephemeral remotes with full local parity—so coding agents and humans can develop and e2e-test for real.
+Secure, fast, cost-efficient ephemeral remotes with full local parity—so coding agents and humans can develop and e2e-test for real.
 
 ```bash
 pip install .
@@ -33,8 +33,9 @@ Chosen at `rig init` (`agent.type` in `rig.yml`). `rig attach` opens an SSH TTY 
 | --- | --- | --- |
 | [OpenCode](https://opencode.ai) | `opencode` (default) | Free Zen models without an API key; keyed config uses the paid provider path |
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `claude` | Needs `coding_agent_api_key` (Anthropic) |
+| [Cursor CLI](https://cursor.com/docs/cli/overview) | `cursor` | Installs `agent` on the VM; needs `coding_agent_api_key` (`CURSOR_API_KEY`) |
 
-Agent config scaffolds under `.rig/.opencode/` or `.rig/.claude/` (plus `AGENTS.md`).
+Agent config scaffolds under `.rig/.opencode/`, `.rig/.claude/`, or `.rig/.cursor/` (plus `AGENTS.md`). Independent of `editor` (local IDE for `rig dev`).
 
 ## IDEs
 
@@ -45,7 +46,7 @@ Agent config scaffolds under `.rig/.opencode/` or `.rig/.claude/` (plus `AGENTS.
 | Remote-SSH (default) | VS Code (`code`), VS Code Insiders (`code-insiders`), Cursor (`cursor`), VSCodium (`codium`) |
 | Browser (`--browser`) | code-server (password: vaulted `vscode_browser_password`) |
 
-Pick a local CLI with `--editor`. Browser login: `rig vars decrypt vscode_browser_password`.
+Chosen at `rig init` (`editor` in `rig.yml`), or override with `--editor`. Local Cursor/VS Code talks to the VM over SSH (no Cursor install on the VM). Browser login: `rig vars decrypt vscode_browser_password`.
 
 ## Layout
 
@@ -61,7 +62,7 @@ rig.yml                 # workspace manifest (vm, agent, playbooks, repos)
   vars.yml              # Ansible vars (vaulted secrets OK)
   requirements.yml      # Galaxy collections/roles
   AGENTS.md             # agent instructions
-  .opencode/ | .claude/ # agent config + MCP
+  .opencode/ | .claude/ | .cursor/  # agent config + MCP
   inventory.yml         # generated at create/apply (gitignored)
   collections/ roles/   # Galaxy installs (gitignored)
 ```
@@ -78,7 +79,8 @@ firewall:
   allowed_ips: []     # static allow-list; also merged into dynamic modes
   ports: []           # extra inbound ports, e.g. [8080, "3000-3001", {port: 53, protocol: udp}]
 agent:
-  type: opencode          # or claude
+  type: opencode          # or claude | cursor
+editor: code                  # code | code-insiders | cursor | codium
 playbooks:
   system: .rig/system.yml
   workspace: .rig/workspace.yml
@@ -113,11 +115,15 @@ init  →  create  →  attach | dev | apply  →  destroy
 | **init** | Scaffold `rig.yml` + `.rig/`. Collect Hetzner creds (`~/.rig/config`), repo PATs, agent choice/key. Idempotent: fills missing files only. |
 | **create** | Boot VM (base image, or matching snapshot). Run `system.yml` then `workspace.yml` unless skipped by snapshot. Snapshot after each. Attach agent TTY unless `--no-attach`. |
 | **apply** | Re-run `workspace.yml` (or `--system`) on an existing env. |
-| **attach** | SSH TTY into `opencode` / `claude` on `/workspace`. |
+| **attach** | SSH TTY into `opencode` / `claude` / Cursor `agent` on `/workspace`. |
 | **dev** | Open VS Code/Cursor via Remote-SSH on `/workspace` (or `--browser` for code-server). |
 | **destroy** | Run `finalizers.yml`, then delete VM / firewall / SSH key. |
 
 Last env name is remembered in `/tmp/.rig/last-env` (used when `name` is omitted).
+
+After you leave an agent TTY, rig captures the printed session / resume id (when the agent prints one) under `/tmp/.rig/sessions/<env>`. A later bare `rig attach` reopens that session (`--session` for OpenCode, `--resume` for Claude Code / Cursor). Pass `-c` / `--session` / `--resume` to override.
+
+After you leave an agent TTY, rig captures the printed session / resume id (when the agent prints one) under `/tmp/.rig/sessions/<env>`. A later bare `rig attach` reopens that session (`--session` for OpenCode, `--resume` for Claude Code / Cursor). Pass `-c` / `--session` / `--resume` to override.
 
 ### Snapshots
 
@@ -140,8 +146,8 @@ Global: `-v` debug · `-q` warnings/errors only · `--version`
 | `init` | | Interactive scaffold |
 | `create` | `[--name]` `[--type]` `[--availability-zone]` `[--image]` `[--no-attach]` `[--force-playbooks\|--force-system\|--force-workspace]` | VM defaults from `rig.yml`; flags override. `--region` aliases `--availability-zone`. |
 | `apply` | `[name]` `[--system]` | Default: workspace playbook |
-| `attach` | `[name]` `[-c\|--continue]` `[-s\|--session ID]` `[--resume [ID]]` `[-- …agent args]` | Forwards flags to the agent |
-| `dev` | `[name]` `[--path /workspace]` `[--browser]` `[--editor code\|cursor\|…]` | Remote-SSH by default |
+| `attach` | `[name]` `[-c\|--continue]` `[-s\|--session ID]` `[--resume [ID]]` `[-- …agent args]` | Reopens last remembered session by default; flags override |
+| `dev` | `[name]` `[--path /workspace]` `[--browser]` `[--editor code\|cursor\|…]` | Remote-SSH by default; `--editor` overrides `editor` in `rig.yml` |
 | `list` | | Lists envs, or `No remote environments` |
 | `destroy` | `[name …]` | Runs finalizers first; multi-name OK |
 | `cache` | `[--system] clear` | Delete workspace or system snapshots |

@@ -97,7 +97,7 @@ def test_interactive_init_selects_projects(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "rig", ""])
+    answers = iter(["all", "rig", "", ""])  # agent, editor defaults
     assert interactive_env_init(
         str(rig),
         input_fn=lambda _prompt: next(answers),
@@ -134,7 +134,7 @@ def test_interactive_init_defaults_to_current_repo(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["", "", ""])  # current repo, name, agent
+    answers = iter(["", "", "", ""])  # current repo, name, agent, editor
     assert interactive_env_init(
         str(rig),
         input_fn=lambda _prompt: next(answers),
@@ -145,6 +145,7 @@ def test_interactive_init_defaults_to_current_repo(tmp_path):
 
     manifest = yaml.safe_load((rig / "rig.yml").read_text())
     assert manifest["name"] == "rig"
+    assert manifest["editor"] == "code"
     assert [repo["name"] for repo in manifest["repos"]] == ["rig"]
 
 
@@ -153,7 +154,7 @@ def test_cli_init_uses_interactive_flow(tmp_path, monkeypatch):
     _git_init(repo, "https://github.com/org/solo.git")
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
-    answers = iter(["all", "solo", ""])
+    answers = iter(["all", "solo", "", ""])  # agent, editor defaults
     monkeypatch.chdir(repo)
     monkeypatch.setattr(
         "cli.main.interactive_env_init",
@@ -183,7 +184,7 @@ def test_interactive_init_stores_encrypted_git_pat(tmp_path):
     data_key.write_text("vault-pass\n")
 
     # Decline default → repo-specific {project}_git_pat
-    answers = iter(["all", "rig", "", "n"])  # agent default, decline default PAT
+    answers = iter(["all", "rig", "", "", "n"])  # agent, editor, decline default PAT
     secrets = iter(["ghp_test_pat_value", "agent-key-value"])
 
     from unittest.mock import patch
@@ -232,7 +233,7 @@ def test_interactive_init_scaffolds_opencode_agent_files(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "rig", "opencode"])
+    answers = iter(["all", "rig", "opencode", "cursor"])
     assert interactive_env_init(
         str(rig),
         input_fn=lambda _prompt: next(answers),
@@ -243,6 +244,7 @@ def test_interactive_init_scaffolds_opencode_agent_files(tmp_path):
 
     manifest = yaml.safe_load((rig / "rig.yml").read_text())
     assert manifest["agent"]["type"] == "opencode"
+    assert manifest["editor"] == "cursor"
     assert (rig / ".rig" / "AGENTS.md").is_file()
     assert (rig / ".rig" / ".opencode" / "opencode.json").is_file()
     assert (rig / ".rig" / ".opencode" / "mcp.json").is_file()
@@ -264,7 +266,7 @@ def test_interactive_init_scaffolds_claude_agent_files(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "rig", "claude"])
+    answers = iter(["all", "rig", "claude", ""])  # editor default
     assert interactive_env_init(
         str(rig),
         input_fn=lambda _prompt: next(answers),
@@ -275,6 +277,7 @@ def test_interactive_init_scaffolds_claude_agent_files(tmp_path):
 
     manifest = yaml.safe_load((rig / "rig.yml").read_text())
     assert manifest["agent"]["type"] == "claude"
+    assert manifest["editor"] == "code"
     vars_data = yaml.load((rig / ".rig" / "vars.yml").read_text(), Loader=_VarsLoader)
     assert vars_data["coding_agent_type"] == "claude"
     assert (rig / ".rig" / "AGENTS.md").is_file()
@@ -284,6 +287,35 @@ def test_interactive_init_scaffolds_claude_agent_files(tmp_path):
     assert "Deploy AGENTS.md as Claude global rules" in system
 
 
+def test_interactive_init_scaffolds_cursor_agent_files(tmp_path):
+    root = tmp_path / "mystack"
+    rig = root / "rig"
+    _git_init(rig, "https://github.com/mystack-cloud/rig.git")
+    data_key = tmp_path / "data-key"
+    data_key.write_text("vault-pass\n")
+
+    answers = iter(["all", "rig", "cursor", "code"])
+    assert interactive_env_init(
+        str(rig),
+        input_fn=lambda _prompt: next(answers),
+        secret_fn=lambda _prompt: "",
+        config_path=str(tmp_path / "rig-config"),
+        data_key_path=str(data_key),
+    )
+
+    manifest = yaml.safe_load((rig / "rig.yml").read_text())
+    assert manifest["agent"]["type"] == "cursor"
+    assert manifest["editor"] == "code"
+    vars_data = yaml.load((rig / ".rig" / "vars.yml").read_text(), Loader=_VarsLoader)
+    assert vars_data["coding_agent_type"] == "cursor"
+    assert (rig / ".rig" / ".cursor" / "cli-config.json").is_file()
+    assert (rig / ".rig" / ".cursor" / "mcp.json").is_file()
+    system = (rig / ".rig" / "system.yml").read_text()
+    assert "Install Cursor CLI" in system
+    assert "CURSOR_API_KEY" in system
+    assert "coding_agent_type == \"cursor\"" in system
+
+
 def test_interactive_init_converts_ssh_remote_to_https_and_stores_pat(tmp_path):
     root = tmp_path / "mystack"
     api = root / "api"
@@ -291,7 +323,7 @@ def test_interactive_init_converts_ssh_remote_to_https_and_stores_pat(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "api", "", "y"])  # agent default, accept default PAT
+    answers = iter(["all", "api", "", "", "y"])  # agent, editor, accept default PAT
     secrets = iter(["ghp_from_ssh", "agent-key"])
 
     from unittest.mock import patch
@@ -329,7 +361,7 @@ def test_interactive_init_stores_default_provider_pat_when_requested(tmp_path):
     data_key.write_text("vault-pass\n")
 
     # Accept default (Enter / Y) → github_pat even for a single repo
-    answers = iter(["all", "rig", "", ""])  # agent + accept default PAT
+    answers = iter(["all", "rig", "", "", ""])  # agent, editor, accept default PAT
     secrets = iter(["ghp_default_pat", "agent-key-value"])
 
     from unittest.mock import patch
@@ -368,7 +400,7 @@ def test_init_records_git_providers_for_system_playbook(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "mystack", ""])
+    answers = iter(["all", "mystack", "", ""])  # agent, editor
     assert interactive_env_init(
         str(root),
         input_fn=lambda _prompt: next(answers),
@@ -397,7 +429,7 @@ def test_interactive_init_reuses_provider_pat_across_repos(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "mystack", "", "y"])
+    answers = iter(["all", "mystack", "", "", "y"])
     # First repo PAT, accept default, second Enter to reuse, then coding agent key.
     secrets = iter(["ghp_shared_pat", "", "agent-key"])
 
@@ -440,7 +472,7 @@ def test_interactive_init_stores_repo_specific_pats_when_different(tmp_path):
     data_key.write_text("vault-pass\n")
 
     # Decline default for both providers → {project}_git_pat each
-    answers = iter(["all", "mystack", "", "n", "n"])
+    answers = iter(["all", "mystack", "", "", "n", "n"])
     secrets = iter(["ghp_api_only", "glpat_web_only", "agent-key"])
 
     from unittest.mock import patch
@@ -501,6 +533,7 @@ def test_interactive_init_prompts_for_missing_credentials(tmp_path, monkeypatch)
         "all",
         "rig",
         "",  # coding agent default (opencode)
+        "",  # editor default (code)
         "",  # skip PAT
         "",  # skip coding agent API key
     ])
@@ -525,7 +558,7 @@ def test_reinit_adds_missing_files_only(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "rig", "", "all", "rig", ""])
+    answers = iter(["all", "rig", "", "", "all", "rig", "", ""])
     assert interactive_env_init(
         str(rig),
         input_fn=lambda _prompt: next(answers),

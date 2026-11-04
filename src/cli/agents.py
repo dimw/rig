@@ -1,7 +1,7 @@
 """
 Coding agent definitions and local .rig scaffolding.
 
-Supported agents (initially): opencode, claude (Claude Code).
+Supported agents: opencode, claude (Claude Code), cursor (Cursor CLI).
 
 Layout under the project (committed, user-editable):
 
@@ -10,6 +10,8 @@ Layout under the project (committed, user-editable):
   .rig/.opencode/mcp.json        # OpenCode MCP servers
   .rig/.claude/settings.json     # Claude Code settings
   .rig/.claude/mcp.json          # Claude Code MCP servers (.mcp.json on remote)
+  .rig/.cursor/cli-config.json   # Cursor CLI config
+  .rig/.cursor/mcp.json          # Cursor CLI MCP servers
 """
 
 from __future__ import annotations
@@ -18,11 +20,12 @@ import json
 import os
 from typing import Any, Callable, Dict, List, Optional
 
-SUPPORTED_AGENTS = ("opencode", "claude")
+SUPPORTED_AGENTS = ("opencode", "claude", "cursor")
 
 AGENT_LABELS = {
     "opencode": "OpenCode",
     "claude": "Claude Code",
+    "cursor": "Cursor CLI",
 }
 
 # Env var name referenced from generated configs; set by system.yml on the VM.
@@ -139,6 +142,21 @@ CLAUDE_MCP: Dict[str, Any] = {
     }
 }
 
+# Cursor CLI (~/.cursor/cli-config.json). API key via CURSOR_API_KEY on the VM.
+CURSOR_CLI_CONFIG: Dict[str, Any] = {
+    "permissions": {
+        "allow": [
+            "Shell(*)",
+            "Read(*)",
+            "Write(*)",
+        ],
+    },
+}
+
+CURSOR_MCP: Dict[str, Any] = {
+    "mcpServers": {},
+}
+
 
 def normalize_agent_type(value: Optional[str]) -> str:
     raw = (value or "").strip().lower().replace(" ", "-").replace("_", "-")
@@ -148,6 +166,9 @@ def normalize_agent_type(value: Optional[str]) -> str:
         "claude": "claude",
         "claude-code": "claude",
         "anthropic": "claude",
+        "cursor": "cursor",
+        "cursor-cli": "cursor",
+        "cursor-agent": "cursor",
     }
     agent = aliases.get(raw, raw)
     if agent not in SUPPORTED_AGENTS:
@@ -160,7 +181,11 @@ def normalize_agent_type(value: Optional[str]) -> str:
 
 def agent_config_dir_name(agent_type: str) -> str:
     agent = normalize_agent_type(agent_type)
-    return ".opencode" if agent == "opencode" else ".claude"
+    if agent == "opencode":
+        return ".opencode"
+    if agent == "cursor":
+        return ".cursor"
+    return ".claude"
 
 
 def agent_remote_paths(agent_type: str) -> Dict[str, str]:
@@ -173,6 +198,14 @@ def agent_remote_paths(agent_type: str) -> Dict[str, str]:
             "mcp_file": "/root/.config/opencode/mcp.json",
             "rules_file": "/root/.config/opencode/AGENTS.md",
             "env_file": "/root/.config/opencode/credentials.env",
+        }
+    if agent == "cursor":
+        return {
+            "config_dir": "/root/.cursor",
+            "config_file": "/root/.cursor/cli-config.json",
+            "mcp_file": "/root/.cursor/mcp.json",
+            "rules_file": "/workspace/AGENTS.md",
+            "env_file": "/root/.cursor/credentials.env",
         }
     return {
         "config_dir": "/root/.claude",
@@ -229,6 +262,16 @@ def ensure_agent_scaffold(
         if force or not os.path.exists(mcp_path):
             _write_json(mcp_path, OPENCODE_MCP)
             created.append(".rig/.opencode/mcp.json")
+    elif agent == "cursor":
+        cfg_dir = os.path.join(rig_dir, ".cursor")
+        config_path = os.path.join(cfg_dir, "cli-config.json")
+        mcp_path = os.path.join(cfg_dir, "mcp.json")
+        if force or not os.path.exists(config_path):
+            _write_json(config_path, CURSOR_CLI_CONFIG)
+            created.append(".rig/.cursor/cli-config.json")
+        if force or not os.path.exists(mcp_path):
+            _write_json(mcp_path, CURSOR_MCP)
+            created.append(".rig/.cursor/mcp.json")
     else:
         cfg_dir = os.path.join(rig_dir, ".claude")
         config_path = os.path.join(cfg_dir, "settings.json")
