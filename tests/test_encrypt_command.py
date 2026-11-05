@@ -259,13 +259,13 @@ def test_decrypt_uses_default_data_key_without_flag(tmp_path):
 
 
 def test_decrypt_requires_data_key(tmp_path):
+    # Per-test key dir from conftest is empty; no wraps in project either.
     with pytest.raises(ValueError, match="not found|Missing key wraps|No data keys"):
-        # Force require_wraps path by clearing tmp keys and pointing at empty project
-        for name in (".personal-data-key", ".shared-data-key", ".data-key"):
-            pth = f"/tmp/.rig/{name}"
-            if os.path.exists(pth):
-                os.unlink(pth)
-        interactive_decrypt(path=str(tmp_path / "missing-key"), name="x", project_dir=str(tmp_path / "empty"))
+        interactive_decrypt(
+            path=str(tmp_path / "missing-key"),
+            name="x",
+            project_dir=str(tmp_path / "empty"),
+        )
 
 
 def test_help_lists_encrypt_and_stdin_name(capsys):

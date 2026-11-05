@@ -32,12 +32,8 @@ def _hetzner_env(monkeypatch, tmp_path):
     monkeypatch.delenv("RIG_GITHUB_PAT", raising=False)
     monkeypatch.delenv("RIG_CODING_AGENT_API_KEY", raising=False)
     monkeypatch.delenv("RIG_IDENTITY", raising=False)
-    # Isolate ~/.rig/config identity writes and ephemeral data keys per test.
+    # Isolate ~/.rig/config identity writes (tmp data keys: tests/conftest.py).
     monkeypatch.setenv("RIG_CONFIG", str(tmp_path / "home-rig-config"))
-    for name in (".personal-data-key", ".shared-data-key", ".data-key"):
-        path = f"/tmp/.rig/{name}"
-        if os.path.exists(path):
-            os.unlink(path)
 
 
 def _answers(*items):

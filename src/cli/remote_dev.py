@@ -3815,33 +3815,40 @@ def interactive_env_init(
         print("Existing rig.yml found — reinitializing and adding any missing files.")
 
     # Identity + master-key wraps before any vaulted secret prompts.
+    # If wraps already exist, unlock into /tmp/.rig (no re-bootstrap).
     try:
-        from cli.vault_keys import bootstrap_identity_keys, tmp_data_keys_present
+        from cli.vault_keys import (
+            bootstrap_identity_keys,
+            personal_vars_path,
+            read_wrap_fields,
+            resolve_identity,
+            tmp_data_keys_present,
+            unlock_data_keys,
+        )
         from cli.config import RigConfig as _RigConfig
 
-        if not tmp_data_keys_present():
-            bootstrap_identity_keys(
-                root,
-                input_fn=input_fn,
-                secret_fn=secret_fn,
-                config=_RigConfig(path=config_path),
-            )
-        else:
-            # Still ensure identity is set when keys already materialized.
-            from cli.vault_keys import resolve_identity, personal_vars_path, read_wrap_fields
-
-            cfg = _RigConfig(path=config_path)
-            ident = resolve_identity(config=cfg)
+        cfg = _RigConfig(path=config_path)
+        ident = resolve_identity(config=cfg)
+        wraps = read_wrap_fields(personal_vars_path(root, ident))
+        if wraps:
             if not cfg.get_identity():
                 cfg.set_identity(ident)
-            if not read_wrap_fields(personal_vars_path(root, ident)):
-                bootstrap_identity_keys(
+            if not tmp_data_keys_present():
+                unlock_data_keys(
                     root,
                     identity=ident,
                     input_fn=input_fn,
                     secret_fn=secret_fn,
-                    config=cfg,
+                    require_wraps=True,
                 )
+        else:
+            bootstrap_identity_keys(
+                root,
+                identity=ident if cfg.get_identity() else None,
+                input_fn=input_fn,
+                secret_fn=secret_fn,
+                config=cfg,
+            )
     except (ValueError, RuntimeError) as exc:
         print(f"Error: {exc}")
         return False
