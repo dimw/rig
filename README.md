@@ -59,7 +59,8 @@ rig.yml                 # workspace manifest (vm, agent, playbooks, repos)
   system.yml            # auto-generated; code-server + agent + gh/glab
   workspace.yml         # custom; clone repos / project setup
   finalizers.yml        # custom; release off-VM resources before destroy
-  vars.yml              # Ansible vars (vaulted secrets OK)
+  vars.yml              # Shared Ansible vars (vaulted with shared data key)
+  vars.<identity>.yml   # Personal secrets + master-key wraps (committed)
   requirements.yml      # Galaxy collections/roles
   AGENTS.md             # agent instructions
   .opencode/ | .claude/ | .cursor/  # agent config + MCP
@@ -151,12 +152,14 @@ Global: `-v` debug · `-q` warnings/errors only · `--version`
 | `list` | | Lists envs, or `No remote environments` |
 | `destroy` | `[name …]` | Runs finalizers first; multi-name OK |
 | `cache` | `[--system] clear` | Delete workspace or system snapshots |
-| `vars encrypt` | `[--stdin-name VAR]` | Vault into `.rig/vars.yml` via `/tmp/.rig/.data-key` |
-| `vars decrypt` | `[VAR]` | Decrypt from `.rig/vars.yml` |
+| `vars encrypt` | `[--stdin-name VAR]` `[--personal]` | Vault into shared or identity vars (after master-key unlock) |
+| `vars decrypt` | `[VAR]` | Decrypt from shared or identity vars |
+| `vars list` | | List vaulted names (`shared` / `identity`) |
+| `vars export-shared-key` | | Print shared data key for teammate onboarding |
 
 ## Ansible variables
 
-Playbooks load `.rig/vars.yml` first, then runtime `rig_*` extras (`-e` JSON). Prefer `{{ rig_env_name }}` over hard-coding.
+Playbooks load `.rig/vars.yml` then `.rig/vars.{identity}.yml` (personal wins), then runtime `rig_*` extras. Prefer `{{ rig_env_name }}` over hard-coding.
 
 | Variable | Meaning |
 | --- | --- |
@@ -179,7 +182,7 @@ Playbooks load `.rig/vars.yml` first, then runtime `rig_*` extras (`-e` JSON). P
 | `rig_repos` | `[{name, url, path}, …]` (no secrets) |
 | `rig_git_providers` | e.g. `github`, `gitlab` |
 
-Also available from `vars.yml` (defaults): `workspace_root`, `coding_agent_type`, `git.clone_repos`, vaulted PATs / `coding_agent_api_key`.
+Also available from vars files (defaults): `workspace_root`, `coding_agent_type`, `git.clone_repos`. On `rig init`, git PATs and the coding agent API key default to **personal** storage in `vars.{identity}.yml` (you are asked to confirm); shared secrets such as `vscode_browser_password` live in `vars.yml`.
 
 `vscode_browser_password` is auto-generated (vaulted) for code-server browser login (`rig dev --browser`). Reveal with `rig vars decrypt vscode_browser_password` (also printed when opening browser mode).
 
@@ -187,9 +190,13 @@ Also available from `vars.yml` (defaults): `workspace_root`, `coding_agent_type`
 
 | Source | Purpose |
 | --- | --- |
-| `~/.rig/config` | Hetzner token (+ optional S3). Profile via `RIG_PROFILE` (default `default`). Env vars override. |
-| `/tmp/.rig/.data-key` | Ansible vault password for `.rig/vars.yml` (tmpfs; cleared on reboot). |
-| `/tmp/<env>-key` | Per-env SSH private key (needed for attach / apply / destroy finalizers). |
+| `~/.rig/config` | Hetzner token (+ optional S3) and `identity`. Profile via `RIG_PROFILE`. Env vars override. |
+| Personal master key | Prompted on init/unlock; **never stored**. Unwraps data keys from `vars.{identity}.yml`. |
+| `rig_identity_data_key` / `rig_shared_data_key` | Master-key wraps inside `vars.{identity}.yml` (committed). |
+| `/tmp/.rig/.personal-data-key` / `.shared-data-key` | Materialized Ansible vault passwords after unlock (tmpfs). |
+| `/tmp/<env>-key` | Per-env SSH private key (attach / apply / destroy finalizers). |
+
+`RIG_IDENTITY` overrides the configured identity. Teammates joining an existing workspace paste the shared data key once (`rig vars export-shared-key` from an unlocked machine).
 
 OpenCode without `coding_agent_api_key` uses free Zen models. With a key, config switches to the paid provider path.
 

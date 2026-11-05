@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -19,14 +20,41 @@ from cli.remote_dev import (
 )
 
 
+_MASTER = "test-master-key"
+
+
 @pytest.fixture(autouse=True)
-def _hetzner_env(monkeypatch):
+def _hetzner_env(monkeypatch, tmp_path):
     monkeypatch.setenv("HETZNER_CLOUD_API_TOKEN", "test-token")
     monkeypatch.setenv("HETZNER_S3_ACCESS_KEY", "test-access")
     monkeypatch.setenv("HETZNER_S3_SECRET_KEY", "test-secret")
     monkeypatch.setenv("S3_ENDPOINT_URL", "https://fsn1.your-objectstorage.com")
     monkeypatch.delenv("RIG_GITHUB_PAT", raising=False)
     monkeypatch.delenv("RIG_CODING_AGENT_API_KEY", raising=False)
+    monkeypatch.delenv("RIG_IDENTITY", raising=False)
+    # Isolate ~/.rig/config identity writes and ephemeral data keys per test.
+    monkeypatch.setenv("RIG_CONFIG", str(tmp_path / "home-rig-config"))
+    for name in (".personal-data-key", ".shared-data-key", ".data-key"):
+        path = f"/tmp/.rig/{name}"
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def _answers(*items):
+    """Input answers with leading identity prompt (Enter = OS default)."""
+    return iter(("", *items))
+
+
+def _personal_vars_text(project: Path) -> str:
+    matches = sorted((project / ".rig").glob("vars.*.yml"))
+    assert matches, f"no identity vars under {project / '.rig'}"
+    return matches[0].read_text()
+
+
+def _secrets(*items):
+    """Secret answers: master key + confirm, then optional PAT/agent secrets."""
+    it = iter((_MASTER, _MASTER, *items))
+    return lambda _prompt: next(it, "")
 
 
 def _git_init(path, remote=None):
@@ -97,11 +125,11 @@ def test_interactive_init_in_git_subfolder_writes_locally(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["", "web", "", ""])  # current repo, name, agent, editor
+    answers = _answers("", "web", "", "")  # current repo, name, agent, editor
     assert interactive_env_init(
         str(apps_web),
         input_fn=lambda _prompt: next(answers),
-        secret_fn=lambda _prompt: "",
+        secret_fn=_secrets(),
         config_path=str(tmp_path / "rig-config"),
         data_key_path=str(data_key),
     )
@@ -137,11 +165,11 @@ def test_interactive_init_selects_projects(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "rig", "", ""])  # agent, editor defaults
+    answers = _answers("all", "rig", "", "")  # agent, editor defaults
     assert interactive_env_init(
         str(rig),
         input_fn=lambda _prompt: next(answers),
-        secret_fn=lambda _prompt: "",  # skip PAT
+        secret_fn=_secrets(),  # skip PAT
         config_path=str(tmp_path / "rig-config"),
         data_key_path=str(data_key),
     )
@@ -174,11 +202,11 @@ def test_interactive_init_defaults_to_current_repo(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["", "", "", ""])  # current repo, name, agent, editor
+    answers = _answers("", "", "", "")  # current repo, name, agent, editor
     assert interactive_env_init(
         str(rig),
         input_fn=lambda _prompt: next(answers),
-        secret_fn=lambda _prompt: "",
+        secret_fn=_secrets(),
         config_path=str(tmp_path / "rig-config"),
         data_key_path=str(data_key),
     )
@@ -194,14 +222,14 @@ def test_cli_init_uses_interactive_flow(tmp_path, monkeypatch):
     _git_init(repo, "https://github.com/org/solo.git")
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
-    answers = iter(["all", "solo", "", ""])  # agent, editor defaults
+    answers = _answers("all", "solo", "", "")  # agent, editor defaults
     monkeypatch.chdir(repo)
     monkeypatch.setattr(
         "cli.main.interactive_env_init",
         lambda: interactive_env_init(
             str(repo),
             input_fn=lambda _prompt: next(answers),
-            secret_fn=lambda _prompt: "",
+            secret_fn=_secrets(),
             config_path=str(tmp_path / "rig-config"),
             data_key_path=str(data_key),
         ),
@@ -224,12 +252,12 @@ def test_interactive_init_stores_encrypted_git_pat(tmp_path):
     data_key.write_text("vault-pass\n")
 
     # Decline default → repo-specific {project}_git_pat
-    answers = iter(["all", "rig", "", "", "n"])  # agent, editor, decline default PAT
-    secrets = iter(["ghp_test_pat_value", "agent-key-value"])
+    answers = _answers("all", "rig", "", "", "n", "", "")  # … decline default PAT; personal PAT; personal agent
+    secrets = iter([_MASTER, _MASTER, "ghp_test_pat_value", "agent-key-value"])
 
     from unittest.mock import patch
 
-    def _fake_encrypt(plaintext, name, vault_password_file):
+    def _fake_encrypt(plaintext, name, vault_password_file, vault_id=None):
         return (
             f"{name}: !vault |\n"
             "          $ANSIBLE_VAULT;1.1;AES256\n"
@@ -246,12 +274,13 @@ def test_interactive_init_stores_encrypted_git_pat(tmp_path):
         )
 
     assert enc.call_count == 3  # git pat + agent key + vscode_browser_password
-    vars_text = (rig / ".rig" / "vars.yml").read_text()
-    assert "rig_git_pat: !vault |" in vars_text
-    assert "github_pat:" not in vars_text
-    assert "coding_agent_api_key: !vault |" in vars_text
-    assert "vscode_browser_password: !vault |" in vars_text
-    clone_repos = yaml.load(vars_text, Loader=_VarsLoader)["git"]["clone_repos"]
+    shared_text = (rig / ".rig" / "vars.yml").read_text()
+    personal_text = _personal_vars_text(rig)
+    assert "rig_git_pat: !vault |" in personal_text
+    assert "github_pat:" not in personal_text
+    assert "coding_agent_api_key: !vault |" in personal_text
+    assert "vscode_browser_password: !vault |" in shared_text
+    clone_repos = yaml.load(shared_text, Loader=_VarsLoader)["git"]["clone_repos"]
     assert clone_repos[0]["password_var"] == "rig_git_pat"
     assert (rig / ".rig" / "system.yml").is_file()
     assert (rig / ".rig" / "workspace.yml").is_file()
@@ -273,11 +302,11 @@ def test_interactive_init_scaffolds_opencode_agent_files(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "rig", "opencode", "cursor"])
+    answers = _answers("all", "rig", "opencode", "cursor")
     assert interactive_env_init(
         str(rig),
         input_fn=lambda _prompt: next(answers),
-        secret_fn=lambda _prompt: "",
+        secret_fn=_secrets(),
         config_path=str(tmp_path / "rig-config"),
         data_key_path=str(data_key),
     )
@@ -306,11 +335,11 @@ def test_interactive_init_scaffolds_claude_agent_files(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "rig", "claude", ""])  # editor default
+    answers = _answers("all", "rig", "claude", "")  # editor default
     assert interactive_env_init(
         str(rig),
         input_fn=lambda _prompt: next(answers),
-        secret_fn=lambda _prompt: "",
+        secret_fn=_secrets(),
         config_path=str(tmp_path / "rig-config"),
         data_key_path=str(data_key),
     )
@@ -334,11 +363,11 @@ def test_interactive_init_scaffolds_cursor_agent_files(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "rig", "cursor", "code"])
+    answers = _answers("all", "rig", "cursor", "code")
     assert interactive_env_init(
         str(rig),
         input_fn=lambda _prompt: next(answers),
-        secret_fn=lambda _prompt: "",
+        secret_fn=_secrets(),
         config_path=str(tmp_path / "rig-config"),
         data_key_path=str(data_key),
     )
@@ -363,12 +392,12 @@ def test_interactive_init_converts_ssh_remote_to_https_and_stores_pat(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "api", "", "", "y"])  # agent, editor, accept default PAT
-    secrets = iter(["ghp_from_ssh", "agent-key"])
+    answers = _answers("all", "api", "", "", "y", "", "")  # … accept default PAT; personal PAT; personal agent
+    secrets = iter([_MASTER, _MASTER, "ghp_from_ssh", "agent-key"])
 
     from unittest.mock import patch
 
-    def _fake_encrypt(plaintext, name, vault_password_file):
+    def _fake_encrypt(plaintext, name, vault_password_file, vault_id=None):
         return (
             f"{name}: !vault |\n"
             "          $ANSIBLE_VAULT;1.1;AES256\n"
@@ -386,9 +415,10 @@ def test_interactive_init_converts_ssh_remote_to_https_and_stores_pat(tmp_path):
 
     manifest = yaml.safe_load((api / "rig.yml").read_text())
     assert manifest["repos"][0]["url"] == "https://github.com/org/api.git"
-    vars_text = (api / ".rig" / "vars.yml").read_text()
-    assert "github_pat: !vault |" in vars_text
-    clone_repos = yaml.load(vars_text, Loader=_VarsLoader)["git"]["clone_repos"]
+    shared_text = (api / ".rig" / "vars.yml").read_text()
+    personal_text = _personal_vars_text(api)
+    assert "github_pat: !vault |" in personal_text
+    clone_repos = yaml.load(shared_text, Loader=_VarsLoader)["git"]["clone_repos"]
     assert clone_repos[0]["repo"] == "https://github.com/org/api.git"
     assert clone_repos[0]["password_var"] == "github_pat"
 
@@ -401,12 +431,12 @@ def test_interactive_init_stores_default_provider_pat_when_requested(tmp_path):
     data_key.write_text("vault-pass\n")
 
     # Accept default (Enter / Y) → github_pat even for a single repo
-    answers = iter(["all", "rig", "", "", ""])  # agent, editor, accept default PAT
-    secrets = iter(["ghp_default_pat", "agent-key-value"])
+    answers = _answers("all", "rig", "", "", "", "", "")  # … accept default PAT; personal PAT; personal agent
+    secrets = iter([_MASTER, _MASTER, "ghp_default_pat", "agent-key-value"])
 
     from unittest.mock import patch
 
-    def _fake_encrypt(plaintext, name, vault_password_file):
+    def _fake_encrypt(plaintext, name, vault_password_file, vault_id=None):
         return (
             f"{name}: !vault |\n"
             "          $ANSIBLE_VAULT;1.1;AES256\n"
@@ -423,11 +453,12 @@ def test_interactive_init_stores_default_provider_pat_when_requested(tmp_path):
         )
 
     assert enc.call_count == 3  # github_pat + agent key + vscode_browser_password
-    vars_text = (rig / ".rig" / "vars.yml").read_text()
-    assert "github_pat: !vault |" in vars_text
-    assert "rig_git_pat:" not in vars_text
-    assert "vscode_browser_password: !vault |" in vars_text
-    clone_repos = yaml.load(vars_text, Loader=_VarsLoader)["git"]["clone_repos"]
+    shared_text = (rig / ".rig" / "vars.yml").read_text()
+    personal_text = _personal_vars_text(rig)
+    assert "github_pat: !vault |" in personal_text
+    assert "rig_git_pat:" not in personal_text
+    assert "vscode_browser_password: !vault |" in shared_text
+    clone_repos = yaml.load(shared_text, Loader=_VarsLoader)["git"]["clone_repos"]
     assert clone_repos[0]["password_var"] == "github_pat"
 
 
@@ -440,11 +471,11 @@ def test_init_records_git_providers_for_system_playbook(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "mystack", "", ""])  # agent, editor
+    answers = _answers("all", "mystack", "", "")  # agent, editor
     assert interactive_env_init(
         str(root),
         input_fn=lambda _prompt: next(answers),
-        secret_fn=lambda _prompt: "",
+        secret_fn=_secrets(),
         config_path=str(tmp_path / "rig-config"),
         data_key_path=str(data_key),
     )
@@ -469,13 +500,13 @@ def test_interactive_init_reuses_provider_pat_across_repos(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "mystack", "", "", "y"])
+    answers = _answers("all", "mystack", "", "", "y", "", "")  # default PAT; personal PAT; personal agent
     # First repo PAT, accept default, second Enter to reuse, then coding agent key.
-    secrets = iter(["ghp_shared_pat", "", "agent-key"])
+    secrets = iter([_MASTER, _MASTER, "ghp_shared_pat", "", "agent-key"])
 
     from unittest.mock import patch
 
-    def _fake_encrypt(plaintext, name, vault_password_file):
+    def _fake_encrypt(plaintext, name, vault_password_file, vault_id=None):
         return (
             f"{name}: !vault |\n"
             "          $ANSIBLE_VAULT;1.1;AES256\n"
@@ -493,12 +524,13 @@ def test_interactive_init_reuses_provider_pat_across_repos(tmp_path):
 
     # Shared github PAT + coding agent key + vscode_browser_password
     assert enc.call_count == 3
-    vars_text = (root / ".rig" / "vars.yml").read_text()
-    assert "github_pat: !vault |" in vars_text
-    assert "api_git_pat:" not in vars_text
-    assert "web_git_pat:" not in vars_text
-    assert "vscode_browser_password: !vault |" in vars_text
-    clone_repos = yaml.load(vars_text, Loader=_VarsLoader)["git"]["clone_repos"]
+    shared_text = (root / ".rig" / "vars.yml").read_text()
+    personal_text = _personal_vars_text(root)
+    assert "github_pat: !vault |" in personal_text
+    assert "api_git_pat:" not in personal_text
+    assert "web_git_pat:" not in personal_text
+    assert "vscode_browser_password: !vault |" in shared_text
+    clone_repos = yaml.load(shared_text, Loader=_VarsLoader)["git"]["clone_repos"]
     assert {item["password_var"] for item in clone_repos} == {"github_pat"}
 
 
@@ -512,12 +544,12 @@ def test_interactive_init_stores_repo_specific_pats_when_different(tmp_path):
     data_key.write_text("vault-pass\n")
 
     # Decline default for both providers → {project}_git_pat each
-    answers = iter(["all", "mystack", "", "", "n", "n"])
-    secrets = iter(["ghp_api_only", "glpat_web_only", "agent-key"])
+    answers = _answers("all", "mystack", "", "", "n", "n", "", "")  # decline defaults; personal PAT; personal agent
+    secrets = iter([_MASTER, _MASTER, "ghp_api_only", "glpat_web_only", "agent-key"])
 
     from unittest.mock import patch
 
-    def _fake_encrypt(plaintext, name, vault_password_file):
+    def _fake_encrypt(plaintext, name, vault_password_file, vault_id=None):
         return (
             f"{name}: !vault |\n"
             "          $ANSIBLE_VAULT;1.1;AES256\n"
@@ -534,15 +566,16 @@ def test_interactive_init_stores_repo_specific_pats_when_different(tmp_path):
         )
 
     assert enc.call_count == 4  # 2 repo pats + agent key + vscode_browser_password
-    vars_text = (root / ".rig" / "vars.yml").read_text()
-    assert "api_git_pat: !vault |" in vars_text
-    assert "web_git_pat: !vault |" in vars_text
-    assert "vscode_browser_password: !vault |" in vars_text
-    assert "github_pat:" not in vars_text
-    assert "gitlab_pat:" not in vars_text
+    shared_text = (root / ".rig" / "vars.yml").read_text()
+    personal_text = _personal_vars_text(root)
+    assert "api_git_pat: !vault |" in personal_text
+    assert "web_git_pat: !vault |" in personal_text
+    assert "vscode_browser_password: !vault |" in shared_text
+    assert "github_pat:" not in personal_text
+    assert "gitlab_pat:" not in personal_text
     by_dest = {
         item["dest"]: item["password_var"]
-        for item in yaml.load(vars_text, Loader=_VarsLoader)["git"]["clone_repos"]
+        for item in yaml.load(shared_text, Loader=_VarsLoader)["git"]["clone_repos"]
     }
     assert by_dest["/workspace/api"] == "api_git_pat"
     assert by_dest["/workspace/web"] == "web_git_pat"
@@ -569,7 +602,10 @@ def test_interactive_init_prompts_for_missing_credentials(tmp_path, monkeypatch)
         "cloud-token",
         "s3-access",
         "s3-secret",
-        "",
+        "",  # endpoint
+        "",  # identity
+        _MASTER,
+        _MASTER,
         "all",
         "rig",
         "",  # coding agent default (opencode)
@@ -598,11 +634,15 @@ def test_reinit_adds_missing_files_only(tmp_path):
     data_key = tmp_path / "data-key"
     data_key.write_text("vault-pass\n")
 
-    answers = iter(["all", "rig", "", "", "all", "rig", "", ""])
+    answers = iter([
+        "", "all", "rig", "", "",  # identity + first init
+        "all", "rig", "", "",      # reinit (keys already materialized)
+    ])
+    secrets = _secrets()
     assert interactive_env_init(
         str(rig),
         input_fn=lambda _prompt: next(answers),
-        secret_fn=lambda _prompt: "",
+        secret_fn=secrets,
         config_path=str(tmp_path / "rig-config"),
         data_key_path=str(data_key),
     )
@@ -616,7 +656,7 @@ def test_reinit_adds_missing_files_only(tmp_path):
     assert interactive_env_init(
         str(rig),
         input_fn=lambda _prompt: next(answers),
-        secret_fn=lambda _prompt: "",
+        secret_fn=secrets,
         config_path=str(tmp_path / "rig-config"),
         data_key_path=str(data_key),
     )

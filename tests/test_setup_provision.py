@@ -151,6 +151,25 @@ def test_apply_command_defaults_to_workspace():
         assert kwargs["playbooks"] == ("system",)
 
 
+def _attach_ssh_command(captured_cmd):
+    """Extract the ssh argv from either a raw ssh run or a ``script -c`` wrapper."""
+    if not captured_cmd:
+        return []
+    if captured_cmd[0] == "ssh" or captured_cmd[0].endswith("/ssh"):
+        return captured_cmd
+    # util-linux: script -q -c 'ssh …' logfile
+    if "-c" in captured_cmd:
+        idx = captured_cmd.index("-c")
+        if idx + 1 < len(captured_cmd):
+            import shlex
+            return shlex.split(captured_cmd[idx + 1])
+    # BSD: script -q logfile ssh …
+    for i, part in enumerate(captured_cmd):
+        if part == "ssh" or part.endswith("/ssh"):
+            return captured_cmd[i:]
+    return captured_cmd
+
+
 def test_attach_to_agent_builds_ssh_tty_command(tmp_path):
     env = RemoteDevEnvironment(name="attach-demo")
     env.vm_ip = "203.0.113.10"
@@ -166,10 +185,11 @@ def test_attach_to_agent_builds_ssh_tty_command(tmp_path):
         code = env.attach_to_agent(agent_type="claude")
 
     assert code == 0
-    assert captured["cmd"][0] == "ssh"
-    assert "-tt" in captured["cmd"]
-    assert "root@203.0.113.10" in captured["cmd"]
-    assert any("exec claude" in part for part in captured["cmd"])
+    ssh_cmd = _attach_ssh_command(captured["cmd"])
+    assert ssh_cmd[0] == "ssh" or ssh_cmd[0].endswith("/ssh")
+    assert "-tt" in ssh_cmd
+    assert "root@203.0.113.10" in ssh_cmd
+    assert any("exec claude" in part for part in ssh_cmd)
 
 
 def test_attach_to_agent_forwards_extra_args():
@@ -190,7 +210,8 @@ def test_attach_to_agent_forwards_extra_args():
         )
 
     assert code == 0
-    remote = captured["cmd"][-1]
+    ssh_cmd = _attach_ssh_command(captured["cmd"])
+    remote = ssh_cmd[-1]
     assert "exec opencode" in remote
     assert "--continue" in remote
     assert "pick" in remote

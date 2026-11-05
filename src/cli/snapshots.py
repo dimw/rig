@@ -60,6 +60,8 @@ _HASH_SKIP_FILE_NAMES = {
     "inventory.yml",  # rewritten every create with VM IP/key
     "system.yml",  # auto-generated; system snapshot is keyed by rig version
 }
+# Personal identity vars (``vars.<identity>.yml``) must not fork workspace snapshots.
+_HASH_IDENTITY_VARS_RE = re.compile(r"^vars\.[^/]+\.yml$")
 _HASH_SKIP_SUFFIXES = (".pyc", ".pyo", ".retry")
 
 
@@ -86,6 +88,9 @@ def iter_workspace_hash_paths(project_dir: str) -> List[str]:
                 if filename in _HASH_SKIP_FILE_NAMES:
                     continue
                 if filename.endswith(_HASH_SKIP_SUFFIXES):
+                    continue
+                # Keep shared vars.yml; skip per-identity personal vars files.
+                if filename != "vars.yml" and _HASH_IDENTITY_VARS_RE.match(filename):
                     continue
                 paths.append(os.path.join(root, filename))
 

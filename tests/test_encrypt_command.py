@@ -130,14 +130,16 @@ def test_encrypt_stdin_reads_until_eof(tmp_path):
         )
 
     assert out.startswith("db_password:")
-    enc.assert_called_once_with("line 1\nline 2\n", "db_password", str(path))
+    enc.assert_called_once_with("line 1\nline 2\n", "db_password", str(path), vault_id=None)
 
 
 def test_interactive_encrypt_creates_key_and_continues(tmp_path):
     key_path = tmp_path / ".rig-tmp" / ".data-key"
     project = tmp_path / "project"
     project.mkdir()
-    answers = iter(["data-key", "data-key", "api_token", "super-secret"])
+    # No wraps yet → legacy data-key prompt, then var name + value.
+    secrets = iter(["data-key", "data-key"])
+    answers = iter(["api_token", "super-secret"])
 
     with patch(
         "cli.encrypt.encrypt_named_value",
@@ -147,7 +149,7 @@ def test_interactive_encrypt_creates_key_and_continues(tmp_path):
             path=str(key_path),
             project_dir=str(project),
             input_fn=lambda _prompt: next(answers),
-            secret_fn=lambda _prompt: next(answers),
+            secret_fn=lambda _prompt: next(secrets),
         )
 
     assert key_path.exists()
@@ -157,6 +159,7 @@ def test_interactive_encrypt_creates_key_and_continues(tmp_path):
         name="api_token",
         vault_password_file=str(key_path),
     )
+    # api_token is treated as shared unless --personal / PAT heuristic
     vars_file = project / ".rig" / "vars.yml"
     assert vars_file.is_file()
     assert "api_token: !vault |" in vars_file.read_text()
@@ -256,8 +259,13 @@ def test_decrypt_uses_default_data_key_without_flag(tmp_path):
 
 
 def test_decrypt_requires_data_key(tmp_path):
-    with pytest.raises(ValueError, match="Temporary data key not found"):
-        interactive_decrypt(path=str(tmp_path / "missing-key"), name="x")
+    with pytest.raises(ValueError, match="not found|Missing key wraps|No data keys"):
+        # Force require_wraps path by clearing tmp keys and pointing at empty project
+        for name in (".personal-data-key", ".shared-data-key", ".data-key"):
+            pth = f"/tmp/.rig/{name}"
+            if os.path.exists(pth):
+                os.unlink(pth)
+        interactive_decrypt(path=str(tmp_path / "missing-key"), name="x", project_dir=str(tmp_path / "empty"))
 
 
 def test_help_lists_encrypt_and_stdin_name(capsys):
@@ -324,7 +332,7 @@ def test_ensure_vscode_browser_password_generates_once(tmp_path, monkeypatch):
 
     created = []
 
-    def fake_store(name, plaintext, project_dir=None, data_key_path=None):
+    def fake_store(name, plaintext, project_dir=None, data_key_path=None, personal=None):
         created.append((name, plaintext))
         path = vars_path_for_project(project_dir)
         with open(path, "a", encoding="utf-8") as handle:

@@ -483,7 +483,11 @@ def _cmd_cache(args: argparse.Namespace) -> int:
 
 def _cmd_encrypt(args: argparse.Namespace) -> int:
     try:
-        ciphertext = interactive_encrypt(stdin_name=args.stdin_name)
+        personal = bool(getattr(args, "personal", False))
+        ciphertext = interactive_encrypt(
+            stdin_name=args.stdin_name,
+            personal=personal if personal else None,
+        )
     except (ValueError, RuntimeError) as exc:
         log.error("%s", exc)
         return 1
@@ -499,6 +503,30 @@ def _cmd_decrypt(args: argparse.Namespace) -> int:
         log.error("%s", exc)
         return 1
     print(plaintext, end="" if plaintext.endswith("\n") else "\n")
+    return 0
+
+
+def _cmd_vars_list(args: argparse.Namespace) -> int:
+    from cli.encrypt import list_all_vault_vars
+
+    rows = list_all_vault_vars()
+    if not rows:
+        print("No vaulted variables found")
+        return 0
+    for name, scope in rows:
+        print(f"{name}\t{scope}")
+    return 0
+
+
+def _cmd_vars_export_shared_key(args: argparse.Namespace) -> int:
+    from cli.encrypt import export_shared_data_key
+
+    try:
+        key = export_shared_data_key()
+    except (ValueError, RuntimeError) as exc:
+        log.error("%s", exc)
+        return 1
+    print(key)
     return 0
 
 
@@ -719,7 +747,7 @@ def main(argv=None):
 
     vars_parser = subparsers.add_parser(
         "vars",
-        help="Manage vaulted values in .rig/vars.yml",
+        help="Manage vaulted values in .rig/vars.yml and vars.{identity}.yml",
     )
     vars_subparsers = vars_parser.add_subparsers(
         dest="vars_command",
@@ -729,22 +757,36 @@ def main(argv=None):
     encrypt_parser = vars_subparsers.add_parser(
         "encrypt",
         help=(
-            "Encrypt a value with a temporary data key and add it to .rig/vars.yml"
+            "Encrypt a value (shared vars.yml, or identity file with --personal / PAT names)"
         ),
     )
     encrypt_parser.add_argument(
         "--stdin-name",
         help="Variable name; read multiline value from stdin until Ctrl+D",
     )
+    encrypt_parser.add_argument(
+        "--personal",
+        action="store_true",
+        help="Store in .rig/vars.{identity}.yml (personal vault)",
+    )
 
     decrypt_parser = vars_subparsers.add_parser(
         "decrypt",
-        help="Decrypt a variable from .rig/vars.yml using the temporary data key",
+        help="Decrypt a variable from shared or personal vars (after master-key unlock)",
     )
     decrypt_parser.add_argument(
         "name",
         nargs="?",
         help="Variable name to decrypt (prompted if omitted)",
+    )
+
+    vars_subparsers.add_parser(
+        "list",
+        help="List vaulted variable names and whether they are shared or identity",
+    )
+    vars_subparsers.add_parser(
+        "export-shared-key",
+        help="Print the shared data key (for teammate onboarding; requires unlock)",
     )
 
     args = parser.parse_args(argv)
@@ -774,6 +816,10 @@ def main(argv=None):
             return _cmd_encrypt(args)
         if args.vars_command == "decrypt":
             return _cmd_decrypt(args)
+        if args.vars_command == "list":
+            return _cmd_vars_list(args)
+        if args.vars_command == "export-shared-key":
+            return _cmd_vars_export_shared_key(args)
         vars_parser.print_help()
         return 1
 
