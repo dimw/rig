@@ -32,6 +32,9 @@ PROFILE_KEYS = (
     "s3_endpoint_url",
 )
 
+# Developer identity for ``.rig/vars.{identity}.yml`` (not a cloud profile).
+IDENTITY_KEY = "identity"
+
 
 def _section_name(profile: str) -> str:
     if profile == DEFAULT_PROFILE:
@@ -151,6 +154,30 @@ class RigConfig:
             if value and not os.getenv(env_name):
                 os.environ[env_name] = value
         return resolved
+
+    def get_identity(self) -> Optional[str]:
+        """Return persisted developer identity from the active profile section."""
+        section = _section_name(self.profile or DEFAULT_PROFILE)
+        if not self._parser.has_section(section):
+            if self.profile != DEFAULT_PROFILE and self._parser.has_section(self.profile):
+                section = self.profile
+            elif self._parser.has_section(DEFAULT_PROFILE):
+                section = DEFAULT_PROFILE
+            else:
+                return None
+        value = self._parser.get(section, IDENTITY_KEY, fallback="").strip()
+        return value or None
+
+    def set_identity(self, identity: str) -> None:
+        """Persist developer identity on the active profile section."""
+        from cli.vault_keys import sanitize_identity
+
+        value = sanitize_identity(identity)
+        section = _section_name(self.profile or DEFAULT_PROFILE)
+        if not self._parser.has_section(section):
+            self._parser.add_section(section)
+        self._parser.set(section, IDENTITY_KEY, value)
+        self.save()
 
 
 def _prompt_secret(message: str, default: str = "", input_fn=None, secret_fn=None) -> str:

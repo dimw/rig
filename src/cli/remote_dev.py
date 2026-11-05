@@ -1373,6 +1373,39 @@ class RemoteDevEnvironment:
         except Exception as exc:
             log.debug("Could not normalize clone destinations: %s", exc)
 
+        # HTTPS clones without a PAT hang on an interactive credential prompt.
+        try:
+            git_cfg = project.get_vars("git") or {}
+            clones = git_cfg.get("clone_repos") or []
+            has_github_pat = bool(project.get_vars("github_pat"))
+            has_gitlab_pat = bool(project.get_vars("gitlab_pat"))
+            missing = []
+            for item in clones:
+                if not isinstance(item, dict):
+                    continue
+                repo = str(item.get("repo") or "")
+                if not repo.startswith("https://"):
+                    continue
+                pat_var = item.get("password_var") or ""
+                if pat_var and project.get_vars(str(pat_var)):
+                    continue
+                if "gitlab.com" in repo and has_gitlab_pat:
+                    continue
+                if "gitlab.com" not in repo and has_github_pat:
+                    continue
+                missing.append(item.get("dest") or repo)
+            if missing and "workspace" in wanted:
+                log.warning(
+                    "HTTPS clone(s) have no PAT (%s). "
+                    "Private repos will fail auth. Store one with: "
+                    "rig vars encrypt github_pat  "
+                    "(then set password_var on each git.clone_repos entry, "
+                    "or rely on github_pat / gitlab_pat fallback)",
+                    ", ".join(str(m) for m in missing),
+                )
+        except Exception as exc:
+            log.debug("Could not preflight git clone credentials: %s", exc)
+
         ansible = AnsibleManager(project)
         if not ansible.configure(project_dir):
             return False
@@ -2352,8 +2385,6 @@ echo "Agent installation complete!"
 
 if __name__ == '__main__':
     # Example usage
-    import sys
-
     token = os.getenv('HETZNER_CLOUD_API_TOKEN')
     if not token:
         print("Error: HETZNER_CLOUD_API_TOKEN not set")
@@ -2843,9 +2874,19 @@ WORKSPACE_PLAYBOOK = """---
     - name: Clone configured git repositories
       vars:
         _pat_var: "{{ item.password_var | default('') }}"
-        _pat: "{{ lookup('vars', _pat_var, default='') if _pat_var else '' }}"
+        # Fall back to provider default vault vars when password_var was skipped at init.
+        _provider_pat: >-
+          {{ (gitlab_pat | default(''))
+             if ('gitlab.com' in (item.repo | default('')))
+             else (github_pat | default('')) }}
+        _pat: >-
+          {{ (lookup('vars', _pat_var, default='') if _pat_var else '')
+             or _provider_pat }}
         # GitHub expects x-access-token; GitLab expects oauth2.
         _auth_user: "{{ 'oauth2' if ('gitlab.com' in item.repo) else 'x-access-token' }}"
+      environment:
+        # Never hang on an interactive username/password prompt (missing PAT).
+        GIT_TERMINAL_PROMPT: "0"
       git:
         repo: >-
           {{ item.repo
@@ -3018,6 +3059,17 @@ class ProjectConfig:
             vars_path = os.path.join(self.rig_dir, self.VARS_YAML)
             if os.path.exists(vars_path):
                 self.vars_config = self._load_vars_with_vault(vars_path)
+            # Merge identity personal vars (PATs, agent key) over shared.
+            try:
+                from cli.vault_keys import personal_vars_path, filter_wrap_fields_from_yaml_text
+                id_path = personal_vars_path(self.project_dir)
+                if os.path.exists(id_path):
+                    personal = self._load_vars_with_vault(id_path)
+                    for key in ("rig_identity_data_key", "rig_shared_data_key"):
+                        personal.pop(key, None)
+                    self.vars_config = {**(self.vars_config or {}), **personal}
+            except Exception:
+                pass
 
             requirements_path = os.path.join(self.rig_dir, self.REQUIREMENTS_YML)
             legacy_requirements = os.path.join(self.rig_dir, "requirements.txt")
@@ -3065,23 +3117,34 @@ class ProjectConfig:
 
             # Check if content is vault encrypted (whole-file vault)
             if content.startswith('$ANSIBLE_VAULT'):
-                # Prefer temporary data key file; fall back to .rig/.vault_password.
                 import tempfile
-                from cli.encrypt import DEFAULT_DATA_KEY_PATH
+                from cli.vault_keys import (
+                    DEFAULT_DATA_KEY_PATH,
+                    PERSONAL_DATA_KEY_PATH,
+                    SHARED_DATA_KEY_PATH,
+                )
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as tmp:
                     tmp.write(content)
                     tmp_path = tmp.name
 
                 try:
                     vault_cmd = ['ansible-vault', 'view', tmp_path]
-                    if os.path.exists(DEFAULT_DATA_KEY_PATH):
-                        vault_cmd[2:2] = ['--vault-password-file', DEFAULT_DATA_KEY_PATH]
+                    vault_ids = []
+                    for label, path in (
+                        ("personal", PERSONAL_DATA_KEY_PATH),
+                        ("shared", SHARED_DATA_KEY_PATH),
+                        ("legacy", DEFAULT_DATA_KEY_PATH),
+                    ):
+                        if os.path.exists(path):
+                            vault_ids.extend(["--vault-id", f"{label}@{path}"])
+                    if vault_ids:
+                        vault_cmd[2:2] = vault_ids
                     elif self.vault_password:
                         vault_cmd[2:2] = ['--vault-password', self.vault_password]
                     else:
                         raise ValueError(
-                            "Vault encrypted file requires temporary data key at "
-                            f"{DEFAULT_DATA_KEY_PATH} or .rig/.vault_password."
+                            "Vault encrypted file requires data keys under /tmp/.rig "
+                            "or .rig/.vault_password."
                         )
                     result = subprocess.run(
                         vault_cmd,
@@ -3096,8 +3159,10 @@ class ProjectConfig:
                 finally:
                     os.unlink(tmp_path)
             else:
-                # Regular YAML (may contain inline !vault scalars)
-                return yaml.load(content, Loader=_VarsLoader) or {}
+                # Regular YAML (may contain inline !vault scalars). Strip key wraps.
+                from cli.vault_keys import filter_wrap_fields_from_yaml_text
+                cleaned = filter_wrap_fields_from_yaml_text(content)
+                return yaml.load(cleaned, Loader=_VarsLoader) or {}
         except Exception as e:
             print(f"Warning: Could not load vars with vault: {e}")
             return {}
@@ -3496,9 +3561,9 @@ def discover_git_projects(directory: str) -> List[Dict[str, str]]:
 def resolve_init_context(start: Optional[str] = None) -> Dict[str, Any]:
     """Choose the folder that should become the environment and its projects.
 
-    If start is inside a git repo, the environment config lives in that repo
-    (so it can be committed). Sibling git projects in the parent folder are
-    still offered for inclusion. Outside a git repo, scan start itself.
+    The environment root is always ``start`` (cwd), including when that path is
+    a subdirectory of a git repo. Nearby sibling git projects are still offered
+    for inclusion. Outside a git repo, scan start itself.
     """
     start = os.path.abspath(start or os.getcwd())
     git_root = _git_root(start)
@@ -3510,7 +3575,7 @@ def resolve_init_context(start: Optional[str] = None) -> Dict[str, Any]:
         ]
         projects = siblings or discover_git_projects(git_root)
         return {
-            "root": git_root,
+            "root": start,
             "projects": projects,
             "current": git_root,
             "in_git_repo": True,
@@ -3720,7 +3785,6 @@ def interactive_env_init(
     from cli.config import RigConfig, ensure_credentials
     from cli.agents import prompt_coding_agent
     from cli.encrypt import (
-        DEFAULT_DATA_KEY_PATH,
         collect_repo_pats,
         prompt_and_store_coding_agent_credentials,
         resolve_repo_pat_var_names,
@@ -3749,6 +3813,38 @@ def interactive_env_init(
         print(f"Current git repo: {current}")
     if already:
         print("Existing rig.yml found — reinitializing and adding any missing files.")
+
+    # Identity + master-key wraps before any vaulted secret prompts.
+    try:
+        from cli.vault_keys import bootstrap_identity_keys, tmp_data_keys_present
+        from cli.config import RigConfig as _RigConfig
+
+        if not tmp_data_keys_present():
+            bootstrap_identity_keys(
+                root,
+                input_fn=input_fn,
+                secret_fn=secret_fn,
+                config=_RigConfig(path=config_path),
+            )
+        else:
+            # Still ensure identity is set when keys already materialized.
+            from cli.vault_keys import resolve_identity, personal_vars_path, read_wrap_fields
+
+            cfg = _RigConfig(path=config_path)
+            ident = resolve_identity(config=cfg)
+            if not cfg.get_identity():
+                cfg.set_identity(ident)
+            if not read_wrap_fields(personal_vars_path(root, ident)):
+                bootstrap_identity_keys(
+                    root,
+                    identity=ident,
+                    input_fn=input_fn,
+                    secret_fn=secret_fn,
+                    config=cfg,
+                )
+    except (ValueError, RuntimeError) as exc:
+        print(f"Error: {exc}")
+        return False
 
     existing = _read_yaml(workspace.manifest_path)
     default_name = existing.get("name") or os.path.basename(root) or "workspace"
@@ -3823,12 +3919,11 @@ def interactive_env_init(
     ):
         return False
 
-    key_path = data_key_path or DEFAULT_DATA_KEY_PATH
     try:
         store_repo_pats(
             pats_to_store,
             project_dir=root,
-            data_key_path=key_path,
+            data_key_path=data_key_path,
             input_fn=input_fn,
             secret_fn=secret_fn,
         )
@@ -3839,7 +3934,7 @@ def interactive_env_init(
         stored_agent_key = bool(
             prompt_and_store_coding_agent_credentials(
                 project_dir=root,
-                data_key_path=key_path,
+                data_key_path=data_key_path,
                 input_fn=input_fn,
                 secret_fn=secret_fn,
                 agent_type=agent_type,
@@ -3855,7 +3950,7 @@ def interactive_env_init(
         )
         if ensure_vscode_browser_password(
             project_dir=root,
-            data_key_path=key_path,
+            data_key_path=data_key_path,
         ):
             print(
                 f"Generated '{VSCODE_BROWSER_PASSWORD_VAR}' for "
@@ -4262,10 +4357,41 @@ class AnsibleManager:
             log.error("project_config is not set")
             return False
 
-        # Prefer vault-aware vars.yml over baking secrets into inventory.yml.
-        vars_path = os.path.join(self.project_config.rig_dir, ProjectConfig.VARS_YAML)
-        if os.path.exists(vars_path):
-            cmd.extend(['-e', f'@{vars_path}'])
+        # Shared + personal vars (personal wins). Strip master-key wraps for ansible.
+        from cli.vault_keys import (
+            PERSONAL_DATA_KEY_PATH,
+            SHARED_DATA_KEY_PATH,
+            personal_vars_path,
+            unlock_data_keys,
+            write_filtered_vars_copy,
+        )
+
+        project_dir = self.project_config.project_dir
+        try:
+            # Prefer master-key wraps; fall back for legacy/test workspaces.
+            unlock_data_keys(project_dir, require_wraps=False)
+        except ValueError as exc:
+            log.error("%s", exc)
+            return False
+
+        shared_vars = os.path.join(self.project_config.rig_dir, ProjectConfig.VARS_YAML)
+        identity_vars = personal_vars_path(project_dir)
+        tmp_dir = os.path.join("/tmp", ".rig", "ansible-vars")
+        os.makedirs(tmp_dir, mode=0o700, exist_ok=True)
+        vars_path = shared_vars
+        if os.path.exists(shared_vars):
+            filtered_shared = write_filtered_vars_copy(
+                shared_vars,
+                os.path.join(tmp_dir, "vars.yml"),
+            )
+            cmd.extend(["-e", f"@{filtered_shared}"])
+            vars_path = filtered_shared
+        if os.path.exists(identity_vars):
+            filtered_identity = write_filtered_vars_copy(
+                identity_vars,
+                os.path.join(tmp_dir, os.path.basename(identity_vars)),
+            )
+            cmd.extend(["-e", f"@{filtered_identity}"])
 
         # Runtime rig_* context (and caller extras) after vars.yml so they win.
         if extra_vars:
@@ -4278,13 +4404,18 @@ class AnsibleManager:
         if runtime_vars:
             cmd.extend(['-e', json.dumps(runtime_vars, default=str)])
 
-        from cli.encrypt import DEFAULT_DATA_KEY_PATH
-        if os.path.exists(DEFAULT_DATA_KEY_PATH):
-            cmd.extend(['--vault-password-file', DEFAULT_DATA_KEY_PATH])
-        elif vault_password:
-            cmd.extend(['--vault-password', vault_password])
-        elif self.vault_password:
-            cmd.extend(['--vault-password', self.vault_password])
+        if os.path.exists(SHARED_DATA_KEY_PATH):
+            cmd.extend(["--vault-id", f"shared@{SHARED_DATA_KEY_PATH}"])
+        if os.path.exists(PERSONAL_DATA_KEY_PATH):
+            cmd.extend(["--vault-id", f"personal@{PERSONAL_DATA_KEY_PATH}"])
+        if vault_password and not (
+            os.path.exists(SHARED_DATA_KEY_PATH) or os.path.exists(PERSONAL_DATA_KEY_PATH)
+        ):
+            cmd.extend(["--vault-password", vault_password])
+        elif self.vault_password and not (
+            os.path.exists(SHARED_DATA_KEY_PATH) or os.path.exists(PERSONAL_DATA_KEY_PATH)
+        ):
+            cmd.extend(["--vault-password", self.vault_password])
 
         roles_path = os.path.join(self.project_config.rig_dir, 'roles')
         collections_path = os.path.join(self.project_config.rig_dir, 'collections')
