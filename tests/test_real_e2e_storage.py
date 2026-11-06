@@ -133,11 +133,14 @@ class TestRealE2EStorage:
 
     def test_shared_state_workflow(self, hetzner_token, tmp_path):
         """Test shared state management workflow"""
+        import uuid
         from cli.storage import StorageManager
 
         storage = StorageManager()
 
-        bucket_name = f"shared-e2e-{hetzner_token[:8].lower()}"
+        # Unique per run — a token-prefixed fixed name races with concurrent CI jobs
+        # and leftover objects on the shared Hetzner account.
+        bucket_name = f"shared-e2e-{uuid.uuid4().hex[:10]}"
 
         # Create shared state bucket
         assert storage.create_bucket(bucket_name) is True

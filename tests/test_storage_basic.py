@@ -74,12 +74,16 @@ class TestBasicStorageOperations:
             mock_s3 = MagicMock()
             mock_boto.return_value = mock_s3
             mock_s3.upload_file.return_value = True
+            mock_s3.head_object.return_value = {}
 
             storage = StorageManager()
             result = storage.upload_file(test_bucket_name, test_file, 'test_object.txt')
 
             assert result is True
             mock_s3.upload_file.assert_called_once()
+            mock_s3.head_object.assert_called_with(
+                Bucket=test_bucket_name, Key='test_object.txt'
+            )
 
     def test_list_objects_command(self, hetzner_token, s3_credentials, test_bucket_name):
         """Test list objects command"""

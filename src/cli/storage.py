@@ -68,6 +68,17 @@ class StorageManager:
             config=self._s3_config(),
         )
 
+    @staticmethod
+    def _is_not_found(exc: BaseException) -> bool:
+        """True for RGW/S3 not-found responses (eventual consistency)."""
+        if not isinstance(exc, ClientError):
+            # boto3 transfer manager wraps some 404s.
+            msg = str(exc)
+            return "404" in msg or "NoSuchKey" in msg or "Not Found" in msg
+        code = str(exc.response.get("Error", {}).get("Code", "") or "")
+        http = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 0)
+        return code in ("404", "NoSuchBucket", "NoSuchKey", "NotFound") or http == 404
+
     def _wait_for_bucket(self, s3_client, bucket_name: str, timeout_s: float = 30.0) -> bool:
         """Poll until the bucket is visible to HeadBucket (eventual consistency)."""
         deadline = time.time() + timeout_s
@@ -77,10 +88,9 @@ class StorageManager:
                 s3_client.head_bucket(Bucket=bucket_name)
                 return True
             except ClientError as exc:
-                code = str(exc.response.get("Error", {}).get("Code", "") or "")
+                # 403 can mean the bucket exists but is not yet readable on this gateway.
                 http = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 0)
-                # Not ready yet.
-                if code in ("404", "NoSuchBucket", "NotFound") or http in (404, 403):
+                if self._is_not_found(exc) or http == 403:
                     time.sleep(delay)
                     delay = min(delay * 1.5, 3.0)
                     continue
@@ -90,6 +100,32 @@ class StorageManager:
                 log.warning("HeadBucket for %r failed: %s", bucket_name, exc)
                 return False
         log.warning("Timed out waiting for bucket %r to become ready", bucket_name)
+        return False
+
+    def _wait_for_object(
+        self, s3_client, bucket_name: str, object_name: str, timeout_s: float = 30.0
+    ) -> bool:
+        """Poll until the object is visible to HeadObject (Hetzner RGW lag)."""
+        deadline = time.time() + timeout_s
+        delay = 0.2
+        while time.time() < deadline:
+            try:
+                s3_client.head_object(Bucket=bucket_name, Key=object_name)
+                return True
+            except Exception as exc:
+                if self._is_not_found(exc):
+                    time.sleep(delay)
+                    delay = min(delay * 1.5, 2.0)
+                    continue
+                log.warning(
+                    "HeadObject for %r/%r failed: %s", bucket_name, object_name, exc
+                )
+                return False
+        log.warning(
+            "Timed out waiting for object %r/%r to become ready",
+            bucket_name,
+            object_name,
+        )
         return False
 
     def create_bucket(self, bucket_name: str, location: Optional[str] = None) -> bool:
@@ -145,37 +181,66 @@ class StorageManager:
 
     def upload_file(self, bucket_name: str, file_path: str, object_name: Optional[str] = None) -> bool:
         """Upload a file to storage"""
-        try:
-            if not os.path.exists(file_path):
-                log.warning("Local file not found for upload: %s", file_path)
+        if not os.path.exists(file_path):
+            log.warning("Local file not found for upload: %s", file_path)
+            return False
+
+        if object_name is None:
+            object_name = os.path.basename(file_path)
+
+        s3_client = self._get_s3_client()
+        deadline = time.time() + 30.0
+        delay = 0.2
+        last_error: Optional[BaseException] = None
+
+        while time.time() < deadline:
+            try:
+                s3_client.upload_file(file_path, bucket_name, object_name)
+                # Hetzner Object Storage can 404 Head/Get for a short window after Put.
+                if not self._wait_for_object(s3_client, bucket_name, object_name):
+                    last_error = RuntimeError("object not visible after upload")
+                    time.sleep(delay)
+                    delay = min(delay * 1.5, 2.0)
+                    continue
+                log.debug("Uploaded %s -> %s/%s", file_path, bucket_name, object_name)
+                return True
+            except Exception as e:
+                last_error = e
+                # RGW gateways briefly return NoSuchBucket even for buckets we just used.
+                if self._is_not_found(e) or "NoSuchBucket" in str(e):
+                    time.sleep(delay)
+                    delay = min(delay * 1.5, 2.0)
+                    continue
+                log.warning("Could not upload file: %s", e)
                 return False
 
-            s3_client = self._get_s3_client()
-
-            if object_name is None:
-                object_name = os.path.basename(file_path)
-
-            s3_client.upload_file(file_path, bucket_name, object_name)
-            log.debug("Uploaded %s -> %s/%s", file_path, bucket_name, object_name)
-            return True
-        except ClientError as e:
-            log.warning("Could not upload file: %s", e)
-            return False
-        except Exception as e:
-            # boto3 wraps some failures (e.g. S3UploadFailedError).
-            log.warning("Could not upload file: %s", e)
-            return False
+        log.warning("Could not upload file after retries: %s", last_error)
+        return False
 
     def download_file(self, bucket_name: str, object_name: str, file_path: str) -> bool:
         """Download a file from storage"""
-        try:
-            s3_client = self._get_s3_client()
-            s3_client.download_file(bucket_name, object_name, file_path)
-            log.debug("Downloaded %s/%s -> %s", bucket_name, object_name, file_path)
-            return True
-        except (ClientError, OSError) as e:
-            log.debug("Could not download file: %s", e)
-            return False
+        s3_client = self._get_s3_client()
+        deadline = time.time() + 30.0
+        delay = 0.2
+        last_error: Optional[BaseException] = None
+        while time.time() < deadline:
+            try:
+                s3_client.download_file(bucket_name, object_name, file_path)
+                log.debug("Downloaded %s/%s -> %s", bucket_name, object_name, file_path)
+                return True
+            except OSError as e:
+                log.debug("Could not download file: %s", e)
+                return False
+            except Exception as e:
+                last_error = e
+                if self._is_not_found(e):
+                    time.sleep(delay)
+                    delay = min(delay * 1.5, 2.0)
+                    continue
+                log.debug("Could not download file: %s", e)
+                return False
+        log.debug("Could not download file after retries: %s", last_error)
+        return False
 
     def list_objects(self, bucket_name: str, prefix: str = "") -> list:
         """List objects in a bucket"""
