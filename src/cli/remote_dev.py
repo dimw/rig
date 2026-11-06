@@ -12,7 +12,7 @@ import shlex
 import subprocess
 import socket
 import webbrowser
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import requests
 
 from cli import log as log
@@ -1041,6 +1041,8 @@ class RemoteDevEnvironment:
             from cli.snapshots import (
                 package_version,
                 resolve_boot_snapshot,
+                system_content_hash,
+                system_hash_inputs_from_project,
                 workspace_content_hash,
             )
         except ImportError:
@@ -1057,7 +1059,13 @@ class RemoteDevEnvironment:
             or os.path.basename(project_dir.rstrip(os.sep))
             or self.name
         )
-        digest = workspace_content_hash(project_dir)
+        digest = workspace_content_hash(project_dir, project=project)
+        sys_inputs = system_hash_inputs_from_project(project)
+        system_hash = system_content_hash(
+            project=project,
+            var_map=sys_inputs.get("var_map"),
+            project_dir=project_dir,
+        )
         version = package_version()
 
         try:
@@ -1071,6 +1079,7 @@ class RemoteDevEnvironment:
             workspace_name=str(workspace_name),
             content_hash=digest,
             version=version,
+            system_hash=system_hash,
         )
         snap = decision.get("image")
         if snap and snap.get("id") is not None:
@@ -1265,16 +1274,16 @@ class RemoteDevEnvironment:
         force_workspace: bool = False,
     ) -> bool:
         """
-        Run Ansible system.yml then workspace.yml against the remote VM.
+        Run provision → configure → authorize → materialize against the remote VM.
 
-        Playbooks already covered by the boot snapshot are skipped unless
-        ``force_system`` / ``force_workspace`` is set.
+        Snapshot-covered provision/configure may be skipped; authorize always
+        runs and is never snapshotted (secrets stay off generic images).
         """
         return self.apply_playbooks(
             project_dir=project_dir,
             stream=stream,
-            playbooks=("system", "workspace"),
-            soft_fail_workspace=True,
+            playbooks=STAGES_CREATE,
+            soft_fail_materialize=True,
             force_system=force_system,
             force_workspace=force_workspace,
             action="create",
@@ -1284,36 +1293,53 @@ class RemoteDevEnvironment:
         self,
         project_dir: Optional[str] = None,
         stream: bool = True,
-        playbooks: tuple = ("workspace",),
-        soft_fail_workspace: bool = False,
+        playbooks: tuple = ("authorize", "materialize"),
+        soft_fail_materialize: bool = False,
+        soft_fail_workspace: bool = False,  # back-compat alias
         force_system: bool = False,
         force_workspace: bool = False,
         action: Optional[str] = None,
     ) -> bool:
         """
-        Re-run selected Ansible playbooks against an existing remote VM.
+        Re-run selected lifecycle playbooks against an existing remote VM.
 
-        ``playbooks`` entries are ``\"system\"`` and/or ``\"workspace\"``
-        (order preserved). Used by ``rig create`` (both) and ``rig apply``
-        (workspace by default, ``--system`` for system.yml).
-
-        When the VM was booted from a matching snapshot, covered playbooks are
-        skipped unless forced.
+        Stages: ``provision``, ``configure``, ``authorize``, ``materialize``
+        (order preserved). ``authorize`` is never skipped via snapshots.
+        Snapshot is taken only after ``configure``. Used by ``rig create`` and
+        ``rig apply``.
         """
+        if soft_fail_workspace:
+            soft_fail_materialize = True
         if not self.vm_ip or not self.ssh_key_name:
             log.error("VM is not ready for provisioning (missing IP or SSH key)")
             return False
 
-        wanted = tuple(p for p in playbooks if p in ("system", "workspace"))
+        wanted = tuple(p for p in playbooks if p in STAGES_CREATE)
         if not wanted:
-            log.error("No playbooks selected (use workspace and/or system)")
+            log.error(
+                "No playbooks selected (use provision, configure, authorize, "
+                "and/or materialize)"
+            )
             return False
 
         skip = set(self.skip_playbooks or ())
-        if force_system:
-            skip.discard("system")
-        if force_workspace:
+        # Legacy skip names from older snapshots / boot decisions.
+        if "system" in skip:
+            skip.add("provision")
+        if "services" in skip or "workspace" in skip:
+            # Old workspace skip meant system+workspace; map to build layer only.
+            if "workspace" in skip and "system" in (self.skip_playbooks or ()):
+                skip.update(SNAPSHOT_COVERED)
             skip.discard("workspace")
+            skip.discard("services")
+        skip.discard("system")
+        for stage in ALWAYS_RUN:
+            skip.discard(stage)
+        if force_system:
+            for stage in SNAPSHOT_COVERED:
+                skip.discard(stage)
+        if force_workspace:
+            skip.discard("materialize")
         if skip:
             skipped = [p for p in wanted if p in skip]
             if skipped:
@@ -1394,7 +1420,7 @@ class RemoteDevEnvironment:
                 if "gitlab.com" not in repo and has_github_pat:
                     continue
                 missing.append(item.get("dest") or repo)
-            if missing and "workspace" in wanted:
+            if missing and "materialize" in wanted:
                 log.warning(
                     "HTTPS clone(s) have no PAT (%s). "
                     "Private repos will fail auth. Store one with: "
@@ -1409,6 +1435,10 @@ class RemoteDevEnvironment:
         ansible = AnsibleManager(project)
         if not ansible.configure(project_dir):
             return False
+        # Refresh managed playbooks so provision/authorize/destroy fixes ship.
+        project.write_provision_playbook(force=True)
+        project.write_authorize_playbook(force=True)
+        project.write_destroy_playbook(force=True)
         if not ansible.setup_bootstrap(self.vm_ip, ssh_key_path):
             return False
         ansible.rig_vars = build_rig_ansible_vars(
@@ -1417,14 +1447,14 @@ class RemoteDevEnvironment:
             action=action or "apply",
         )
 
-        system_path = ansible.playbook_path
-        workspace_path = ansible.workspace_playbook_path
         path_by_kind = {
-            "system": system_path,
-            "workspace": workspace_path,
+            "provision": ansible.playbook_path,
+            "configure": ansible.configure_playbook_path,
+            "authorize": ansible.authorize_playbook_path,
+            "materialize": ansible.materialize_playbook_path,
         }
 
-        workspace_failed = False
+        materialize_failed = False
         for kind in wanted:
             path = path_by_kind.get(kind)
             if not path or not os.path.exists(path):
@@ -1432,21 +1462,22 @@ class RemoteDevEnvironment:
                 return False
             log.info("Running %s playbook", kind)
             if not ansible._run_one_playbook(path, stream=stream):
-                if kind == "workspace" and soft_fail_workspace:
+                if kind == "materialize" and soft_fail_materialize:
                     log.warning(
-                        "Workspace playbook failed (often an invalid git PAT); "
+                        "Materialize playbook failed (often an invalid git PAT); "
                         "continuing"
                     )
-                    workspace_failed = True
+                    materialize_failed = True
                     continue
                 log.error("%s playbook failed", kind.capitalize())
                 return False
-            # Snapshot after each successful playbook (create / apply).
-            if not self._snapshot_after_playbook(kind, project):
-                log.warning("Continuing without a successful %s snapshot", kind)
+            # Snapshot only after configure (build layer); never after authorize.
+            if kind == SNAPSHOT_AFTER:
+                if not self._snapshot_after_playbook(kind, project):
+                    log.warning("Continuing without a successful %s snapshot", kind)
 
-        if workspace_failed:
-            log.info("Playbooks finished (workspace had errors)")
+        if materialize_failed:
+            log.info("Playbooks finished (materialize had errors)")
         else:
             log.info("Playbooks complete")
         return True
@@ -1456,7 +1487,9 @@ class RemoteDevEnvironment:
         kind: str,
         project: "ProjectConfig",
     ) -> bool:
-        """Create the system or workspace Hetzner snapshot for a finished playbook."""
+        """Create the system (build-layer) Hetzner snapshot after configure."""
+        if kind != SNAPSHOT_AFTER:
+            return True
         if not self.vm_id:
             self.resolve_resources()
         if not self.vm_id:
@@ -1466,29 +1499,28 @@ class RemoteDevEnvironment:
         try:
             from cli.snapshots import (
                 package_version,
+                system_content_hash,
+                system_hash_inputs_from_project,
                 system_snapshot_labels,
                 system_snapshot_name,
-                workspace_content_hash,
-                workspace_snapshot_labels,
-                workspace_snapshot_name,
             )
         except ImportError as exc:
             log.warning("Snapshot helpers unavailable: %s", exc)
             return False
 
-        if kind == "system":
-            version = package_version()
-            description = system_snapshot_name(version)
-            labels = system_snapshot_labels(version)
-        else:
-            workspace_name = (
-                (project.config or {}).get("name")
-                or os.path.basename(project.project_dir.rstrip(os.sep))
-                or self.name
-            )
-            digest = workspace_content_hash(project.project_dir)
-            description = workspace_snapshot_name(str(workspace_name), digest)
-            labels = workspace_snapshot_labels(str(workspace_name), digest)
+        version = package_version()
+        inputs = system_hash_inputs_from_project(project)
+        digest = system_content_hash(
+            project=project,
+            var_map=inputs.get("var_map"),
+            project_dir=project.project_dir,
+        )
+        description = system_snapshot_name(version, content_hash=digest)
+        labels = system_snapshot_labels(
+            version,
+            content_hash=digest,
+            agent_type=inputs.get("agent_type"),
+        )
 
         try:
             image = self.manager.create_snapshot(
@@ -1658,65 +1690,72 @@ class RemoteDevEnvironment:
             log.warning("No Hetzner resources found for '%s'", self.name)
         return found_any
 
-    def run_finalizers_playbook(
+    def run_destroy_playbooks(
         self,
         project_dir: Optional[str] = None,
         stream: bool = True,
     ) -> bool:
         """
-        Run ``playbooks.finalizers`` against the live VM before deleting it.
+        Run ``finalize`` then ``destroy`` playbooks before deleting the VM.
 
-        Soft-fails (returns False but does not raise) when the playbook is
-        missing, SSH is unavailable, or Ansible fails — destroy should still
-        proceed so the VM is not left orphaned.
+        Soft-fails when a playbook is missing, SSH is unavailable, or Ansible
+        fails — destroy should still proceed so the VM is not left orphaned.
         """
         project_dir = os.path.abspath(project_dir or os.getcwd())
         if not self.vm_ip:
-            log.debug("Skipping finalizers playbook (no VM IP)")
+            log.debug("Skipping destroy playbooks (no VM IP)")
             return False
 
         ssh_key_path = f"/tmp/{self.ssh_key_name}"
         if not os.path.exists(ssh_key_path):
             log.warning(
-                "Skipping finalizers playbook (SSH key missing at %s)",
+                "Skipping destroy playbooks (SSH key missing at %s)",
                 ssh_key_path,
             )
             return False
 
         project = ProjectConfig(project_dir)
         if not project.load() or not project.config:
-            log.debug("Skipping finalizers playbook (no rig.yml in %s)", project_dir)
+            log.debug("Skipping destroy playbooks (no rig.yml in %s)", project_dir)
             return False
 
         ansible = AnsibleManager(project)
         if not ansible.configure(project_dir):
-            log.warning("Skipping finalizers playbook (Ansible configure failed)")
+            log.warning("Skipping destroy playbooks (Ansible configure failed)")
             return False
 
-        finalizers_path = ansible.finalizers_playbook_path
-        if not finalizers_path or not os.path.exists(finalizers_path):
-            log.debug("Skipping finalizers playbook (not found)")
-            return False
-
-        log.info("Running finalizers playbook before deleting VM")
+        project.write_destroy_playbook(force=True)
+        path_by_kind = {
+            "finalize": ansible.finalize_playbook_path,
+            "destroy": ansible.destroy_playbook_path,
+        }
         if not ansible.setup_bootstrap(self.vm_ip, ssh_key_path):
-            log.warning("Finalizers playbook skipped (could not reach VM)")
+            log.warning("Destroy playbooks skipped (could not reach VM)")
             return False
         ansible.rig_vars = build_rig_ansible_vars(self, project, action="destroy")
-        if not ansible._run_one_playbook(finalizers_path, stream=stream):
-            log.warning("Finalizers playbook failed; continuing with VM deletion")
-            return False
-        log.info("Finalizers playbook finished")
-        return True
+
+        ok = True
+        for kind in STAGES_DESTROY:
+            path = path_by_kind.get(kind)
+            if not path or not os.path.exists(path):
+                log.debug("Skipping %s playbook (not found)", kind)
+                continue
+            log.info("Running %s playbook before deleting VM", kind)
+            if not ansible._run_one_playbook(path, stream=stream):
+                log.warning("%s playbook failed; continuing with VM deletion", kind.capitalize())
+                ok = False
+        if ok:
+            log.info("Destroy playbooks finished")
+        return ok
 
     def cleanup(self, project_dir: Optional[str] = None):
-        """Clean up the remote environment (finalizers playbook, then delete VM)."""
+        """Clean up the remote environment (finalize → destroy playbooks, then delete VM)."""
         log.info("Destroying remote environment '%s'", self.name)
         project_dir = os.path.abspath(project_dir or os.getcwd())
         self.resolve_resources()
-        # Refresh client IP allow-list before finalizers (needs SSH to the VM).
+        # Refresh client IP allow-list before finalize/destroy (needs SSH to the VM).
         self.ensure_firewall_access(project_dir=project_dir)
-        self.run_finalizers_playbook(project_dir=project_dir, stream=True)
+        self.run_destroy_playbooks(project_dir=project_dir, stream=True)
 
         if self.vm_id:
             log.debug("Deleting VM id=%s", self.vm_id)
@@ -2454,10 +2493,24 @@ _VarsLoader.add_constructor("!vault", _construct_vault)
 _VarsDumper.add_representer(VaultEncrypted, _represent_vault)
 
 
-# Auto-generated system bootstrap playbook (.rig/system.yml).
-# Referenced from root rig.yml playbooks.system. Roles can replace this later.
-SYSTEM_PLAYBOOK = r"""---
-# System playbook: base packages, VS Code (code-server), coding agent.
+# Lifecycle stages (flat playbooks under .rig/).
+# Create: provision → configure → [snapshot] → authorize → materialize
+# Destroy: finalize → destroy
+STAGES_CREATE: Tuple[str, ...] = (
+    "provision",
+    "configure",
+    "authorize",
+    "materialize",
+)
+STAGES_DESTROY: Tuple[str, ...] = ("finalize", "destroy")
+SNAPSHOT_AFTER = "configure"
+SNAPSHOT_COVERED: Tuple[str, ...] = ("provision", "configure")
+ALWAYS_RUN = frozenset({"authorize"})
+
+# Auto-generated provision playbook (.rig/provision.yml).
+# Referenced from root rig.yml playbooks.provision.
+PROVISION_PLAYBOOK = r"""---
+# Provision playbook: base packages, VS Code (code-server), coding agent.
 - name: Provision remote system
   hosts: remote_vm
   become: true
@@ -2581,25 +2634,7 @@ SYSTEM_PLAYBOOK = r"""---
         owner: "{{ code_server_user }}"
         group: "{{ code_server_user }}"
         mode: "0700"
-
-    - name: Configure code-server
-      copy:
-        dest: "/home/{{ code_server_user }}/.config/code-server/config.yaml"
-        owner: "{{ code_server_user }}"
-        group: "{{ code_server_user }}"
-        mode: "0600"
-        content: |
-          bind-addr: 0.0.0.0:{{ code_server_port }}
-          auth: password
-          password: "{{ vscode_browser_password }}"
-          cert: false
-
-    - name: Enable and start code-server for user
-      systemd:
-        name: "code-server@{{ code_server_user }}"
-        enabled: true
-        state: started
-        daemon_reload: true
+      # Password + systemd start live in authorize.yml (secrets; not snapshotted).
 
     # --- Coding agent: OpenCode ---
     # Do not use Ansible creates= here: a zero-byte stub is executable and would
@@ -2682,25 +2717,32 @@ SYSTEM_PLAYBOOK = r"""---
         mode: "0644"
       when: coding_agent_type == "opencode"
 
-    - name: Write OpenCode credentials env file
-      copy:
-        dest: /root/.config/opencode/credentials.env
-        mode: "0600"
-        content: |
-          CODING_AGENT_API_KEY={{ coding_agent_api_key }}
-          ANTHROPIC_API_KEY={{ coding_agent_api_key }}
-          OPENCODE_API_KEY={{ coding_agent_api_key }}
-      no_log: true
-      when:
-        - coding_agent_type == "opencode"
-        - coding_agent_api_key is defined
-        - coding_agent_api_key | length > 0
-
     # --- Coding agent: Claude Code ---
+    # Do not use creates= alone: verify the binary actually runs (same as OpenCode).
     - name: Install Claude Code CLI
-      shell: curl -fsSL https://claude.ai/install.sh | bash
+      shell: |
+        set -euo pipefail
+        bin=/root/.local/bin/claude
+        if [ -x "$bin" ] && [ -s "$bin" ] && "$bin" --version >/dev/null 2>&1; then
+          exit 0
+        fi
+        rm -f "$bin"
+        curl -fsSL https://claude.ai/install.sh | bash
+        # Installer may place the binary under ~/.local/bin or elsewhere on PATH.
+        if [ ! -x "$bin" ] || [ ! -s "$bin" ]; then
+          found="$(command -v claude || true)"
+          if [ -n "$found" ] && [ -x "$found" ]; then
+            mkdir -p "$(dirname "$bin")"
+            ln -sfn "$found" "$bin"
+          fi
+        fi
+        test -s "$bin"
+        test -x "$bin"
+        "$bin" --version
       args:
-        creates: /root/.local/bin/claude
+        executable: /bin/bash
+      environment:
+        HOME: /root
       when: coding_agent_type == "claude"
 
     - name: Ensure Claude local bin is on PATH
@@ -2708,6 +2750,14 @@ SYSTEM_PLAYBOOK = r"""---
         path: /root/.bashrc
         line: 'export PATH="$HOME/.local/bin:$PATH"'
         create: true
+      when: coding_agent_type == "claude"
+
+    - name: Symlink Claude onto PATH
+      file:
+        src: /root/.local/bin/claude
+        dest: /usr/local/bin/claude
+        state: link
+        force: true
       when: coding_agent_type == "claude"
 
     - name: Ensure Claude config directory exists
@@ -2743,19 +2793,6 @@ SYSTEM_PLAYBOOK = r"""---
         src: "{{ playbook_dir }}/AGENTS.md"
         dest: "{{ workspace_root | default('/workspace') }}/AGENTS.md"
         mode: "0644"
-
-    - name: Write Claude credentials env file
-      copy:
-        dest: /root/.claude/credentials.env
-        mode: "0600"
-        content: |
-          CODING_AGENT_API_KEY={{ coding_agent_api_key }}
-          ANTHROPIC_API_KEY={{ coding_agent_api_key }}
-      no_log: true
-      when:
-        - coding_agent_type == "claude"
-        - coding_agent_api_key is defined
-        - coding_agent_api_key | length > 0
 
     # --- Coding agent: Cursor CLI (`agent`) ---
     # Do not use creates= alone: verify the binary actually runs.
@@ -2811,6 +2848,84 @@ SYSTEM_PLAYBOOK = r"""---
         dest: /root/.cursor/mcp.json
         mode: "0600"
       when: coding_agent_type == "cursor"
+"""
+
+# User image customization (.rig/configure.yml). Cached with provision; never secrets.
+CONFIGURE_PLAYBOOK = """---
+# Configure playbook: user image/service customizations (cached in system snapshot).
+# Keep this secret-free — credentials belong in authorize.yml.
+- name: Configure remote services
+  hosts: remote_vm
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Configure placeholder (customize this playbook)
+      debug:
+        msg: >-
+          No custom configure tasks for {{ rig_env_name | default('env') }}.
+          Add secret-free installs/services here (cached with provision).
+"""
+
+# Secrets / auth material (.rig/authorize.yml). Always runs; never snapshotted.
+AUTHORIZE_PLAYBOOK = r"""---
+# Authorize playbook: inject credentials after provision/configure (not snapshotted).
+- name: Authorize remote access
+  hosts: remote_vm
+  become: true
+  gather_facts: false
+  vars:
+    coding_agent_type: "{{ coding_agent_type | default('opencode') }}"
+    code_server_port: "{{ code_server_port | default(8080) }}"
+    code_server_user: "{{ code_server_user | default('coder') }}"
+  tasks:
+    - name: Configure code-server with vaulted browser password
+      copy:
+        dest: "/home/{{ code_server_user }}/.config/code-server/config.yaml"
+        owner: "{{ code_server_user }}"
+        group: "{{ code_server_user }}"
+        mode: "0600"
+        content: |
+          bind-addr: 0.0.0.0:{{ code_server_port }}
+          auth: password
+          password: "{{ vscode_browser_password }}"
+          cert: false
+      no_log: true
+      when: vscode_browser_password is defined and vscode_browser_password | length > 0
+
+    - name: Enable and start code-server for user
+      systemd:
+        name: "code-server@{{ code_server_user }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: vscode_browser_password is defined and vscode_browser_password | length > 0
+
+    - name: Write OpenCode credentials env file
+      copy:
+        dest: /root/.config/opencode/credentials.env
+        mode: "0600"
+        content: |
+          CODING_AGENT_API_KEY={{ coding_agent_api_key }}
+          ANTHROPIC_API_KEY={{ coding_agent_api_key }}
+          OPENCODE_API_KEY={{ coding_agent_api_key }}
+      no_log: true
+      when:
+        - coding_agent_type == "opencode"
+        - coding_agent_api_key is defined
+        - coding_agent_api_key | length > 0
+
+    - name: Write Claude credentials env file
+      copy:
+        dest: /root/.claude/credentials.env
+        mode: "0600"
+        content: |
+          CODING_AGENT_API_KEY={{ coding_agent_api_key }}
+          ANTHROPIC_API_KEY={{ coding_agent_api_key }}
+      no_log: true
+      when:
+        - coding_agent_type == "claude"
+        - coding_agent_api_key is defined
+        - coding_agent_api_key | length > 0
 
     - name: Write Cursor credentials env file
       copy:
@@ -2830,7 +2945,7 @@ SYSTEM_PLAYBOOK = r"""---
         dest: /etc/profile.d/rig-coding-agent.sh
         mode: "0644"
         content: |
-          # Managed by rig system.yml — API key for the selected coding agent.
+          # Managed by rig authorize.yml — API key for the selected coding agent.
           if [ -f /root/.config/opencode/credentials.env ]; then
             set -a
             # shellcheck disable=SC1091
@@ -2852,11 +2967,11 @@ SYSTEM_PLAYBOOK = r"""---
       when: coding_agent_api_key is defined and coding_agent_api_key | length > 0
 """
 
-# Workspace-specific playbook (.rig/workspace.yml). Project/workspace dependent.
-WORKSPACE_PLAYBOOK = """---
-# Workspace playbook: clone configured repos and workspace-specific setup.
+# Materialize playbook (.rig/materialize.yml). Project content after authorize.
+MATERIALIZE_PLAYBOOK = """---
+# Materialize playbook: clone configured repos and populate /workspace.
 # Rig injects runtime vars prefixed with rig_ (e.g. rig_env_name, rig_vm_ip).
-- name: Configure workspace
+- name: Materialize workspace
   hosts: remote_vm
   become: true
   gather_facts: false
@@ -2900,18 +3015,31 @@ WORKSPACE_PLAYBOOK = """---
       when: git is defined and git.clone_repos is defined
 """
 
-FINALIZERS_PLAYBOOK = """---
-# Finalizers: custom workspace resources to release before the VM is deleted
+FINALIZE_PLAYBOOK = """---
+# Finalize: user-defined destruction hooks before managed destroy
 # (``rig destroy``). May target off-VM resources (DNS, volumes, cloud APIs,
 # SaaS tenants) as well as the host. Runs with rig_* vars (e.g. rig_env_name).
-- name: Workspace finalizers
+- name: Finalize workspace
   hosts: remote_vm
   become: true
   gather_facts: false
   tasks:
-    - name: Finalizers placeholder (customize this playbook)
+    - name: Finalize placeholder (customize this playbook)
       debug:
-        msg: "No custom finalizer tasks for {{ rig_env_name | default('env') }}"
+        msg: "No custom finalize tasks for {{ rig_env_name | default('env') }}"
+"""
+
+DESTROY_PLAYBOOK = """---
+# Destroy playbook: managed teardown of system resources before the VM is deleted.
+# Auto-generated; do not put project-specific hooks here (use finalize.yml).
+- name: Destroy managed environment
+  hosts: remote_vm
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Managed destroy placeholder
+      debug:
+        msg: "No managed destroy tasks for {{ rig_env_name | default('env') }}"
 """
 
 
@@ -2921,11 +3049,14 @@ class ProjectConfig:
     RIG_DIR = ".rig"
     RIG_YAML = "rig.yml"
     VARS_YAML = "vars.yml"
-    SYSTEM_YAML = "system.yml"
-    WORKSPACE_YAML = "workspace.yml"
-    FINALIZERS_YAML = "finalizers.yml"
+    PROVISION_YAML = "provision.yml"
+    MATERIALIZE_YAML = "materialize.yml"
+    AUTHORIZE_YAML = "authorize.yml"
+    FINALIZE_YAML = "finalize.yml"
+    CONFIGURE_YAML = "configure.yml"
+    DESTROY_YAML = "destroy.yml"
     # Back-compat aliases
-    INIT_YAML = SYSTEM_YAML
+    INIT_YAML = PROVISION_YAML
     SETUP_YAML = RIG_YAML
     REQUIREMENTS_YML = "requirements.yml"
     # Back-compat alias
@@ -2995,9 +3126,12 @@ class ProjectConfig:
             # Preferred local CLI for ``rig dev`` (Remote-SSH).
             "editor": DEFAULT_EDITOR,
             "playbooks": {
-                "system": f"{self.RIG_DIR}/{self.SYSTEM_YAML}",
-                "workspace": f"{self.RIG_DIR}/{self.WORKSPACE_YAML}",
-                "finalizers": f"{self.RIG_DIR}/{self.FINALIZERS_YAML}",
+                "provision": f"{self.RIG_DIR}/{self.PROVISION_YAML}",
+                "configure": f"{self.RIG_DIR}/{self.CONFIGURE_YAML}",
+                "authorize": f"{self.RIG_DIR}/{self.AUTHORIZE_YAML}",
+                "materialize": f"{self.RIG_DIR}/{self.MATERIALIZE_YAML}",
+                "finalize": f"{self.RIG_DIR}/{self.FINALIZE_YAML}",
+                "destroy": f"{self.RIG_DIR}/{self.DESTROY_YAML}",
             },
             "inventory": f"{self.RIG_DIR}/inventory.yml",
             "repos": [],
@@ -3048,9 +3182,12 @@ class ProjectConfig:
                         self.config = self._merge_missing(self.config, {
                             "agent": legacy.get("agent") or {},
                             "playbooks": {
-                                "system": f"{self.RIG_DIR}/{self.SYSTEM_YAML}",
-                                "workspace": f"{self.RIG_DIR}/{self.WORKSPACE_YAML}",
-                                "finalizers": f"{self.RIG_DIR}/{self.FINALIZERS_YAML}",
+                                "provision": f"{self.RIG_DIR}/{self.PROVISION_YAML}",
+                                "configure": f"{self.RIG_DIR}/{self.CONFIGURE_YAML}",
+                                "authorize": f"{self.RIG_DIR}/{self.AUTHORIZE_YAML}",
+                                "materialize": f"{self.RIG_DIR}/{self.MATERIALIZE_YAML}",
+                                "finalize": f"{self.RIG_DIR}/{self.FINALIZE_YAML}",
+                                "destroy": f"{self.RIG_DIR}/{self.DESTROY_YAML}",
                             },
                             "inventory": f"{self.RIG_DIR}/inventory.yml",
                             "bootstrap": legacy.get("bootstrap") or {},
@@ -3236,11 +3373,29 @@ class ProjectConfig:
                 if name and not self.config.get("name"):
                     self.config["name"] = name
                 self.config = self._merge_missing(self.config, defaults)
-                # Prefer playbooks.system/workspace/finalizers over legacy bootstrap.playbook
+                # Prefer playbooks.system/workspace/authnz/finalizers over legacy bootstrap.playbook
                 playbooks = self.config.setdefault("playbooks", {})
-                playbooks.setdefault("system", f"{self.RIG_DIR}/{self.SYSTEM_YAML}")
-                playbooks.setdefault("workspace", f"{self.RIG_DIR}/{self.WORKSPACE_YAML}")
-                playbooks.setdefault("finalizers", f"{self.RIG_DIR}/{self.FINALIZERS_YAML}")
+                playbooks.setdefault("provision", f"{self.RIG_DIR}/{self.PROVISION_YAML}")
+                playbooks.setdefault("configure", f"{self.RIG_DIR}/{self.CONFIGURE_YAML}")
+                playbooks.setdefault("authorize", f"{self.RIG_DIR}/{self.AUTHORIZE_YAML}")
+                playbooks.setdefault("materialize", f"{self.RIG_DIR}/{self.MATERIALIZE_YAML}")
+                playbooks.setdefault("finalize", f"{self.RIG_DIR}/{self.FINALIZE_YAML}")
+                playbooks.setdefault("destroy", f"{self.RIG_DIR}/{self.DESTROY_YAML}")
+                # Migrate legacy playbook keys if present.
+                _legacy = {
+                    "system": "provision",
+                    "services": "configure",
+                    "authnz": "authorize",
+                    "secrets": "authorize",
+                    "workspace": "materialize",
+                    "finalizers": "finalize",
+                    "teardown": "destroy",
+                }
+                for old_key, new_key in _legacy.items():
+                    if old_key in playbooks and new_key not in playbooks:
+                        playbooks[new_key] = playbooks.pop(old_key)
+                    elif old_key in playbooks:
+                        playbooks.pop(old_key, None)
                 self.config.setdefault("inventory", f"{self.RIG_DIR}/inventory.yml")
                 if yaml.dump(self.config, sort_keys=True) != before and self.RIG_YAML not in created:
                     created.append(f"{self.RIG_YAML} (updated)")
@@ -3272,45 +3427,53 @@ class ProjectConfig:
             if not os.path.exists(requirements_path):
                 created.append(f"{self.RIG_DIR}/{self.REQUIREMENTS_YML}")
 
-            system_path = os.path.join(self.rig_dir, self.SYSTEM_YAML)
-            workspace_path = os.path.join(self.rig_dir, self.WORKSPACE_YAML)
-            finalizers_path = os.path.join(self.rig_dir, self.FINALIZERS_YAML)
-            system_missing = not os.path.exists(system_path)
-            workspace_missing = not os.path.exists(workspace_path)
-            finalizers_missing = not os.path.exists(finalizers_path)
+            self._migrate_legacy_playbook_files()
+            stage_paths = {
+                "provision": os.path.join(self.rig_dir, self.PROVISION_YAML),
+                "configure": os.path.join(self.rig_dir, self.CONFIGURE_YAML),
+                "authorize": os.path.join(self.rig_dir, self.AUTHORIZE_YAML),
+                "materialize": os.path.join(self.rig_dir, self.MATERIALIZE_YAML),
+                "finalize": os.path.join(self.rig_dir, self.FINALIZE_YAML),
+                "destroy": os.path.join(self.rig_dir, self.DESTROY_YAML),
+            }
+            missing = {k: not os.path.exists(p) for k, p in stage_paths.items()}
 
             if not self.save(write_vars=write_vars):
                 return False
-            # system.yml is auto-generated; always refresh on init.
-            if not self.write_system_playbook(force=True):
+            # Managed playbooks always refresh; user playbooks only if missing.
+            if not self.write_provision_playbook(force=True):
                 return False
-            if not self.write_workspace_playbook(force=False):
+            if not self.write_configure_playbook(force=False):
                 return False
-            if not self.write_finalizers_playbook(force=False):
+            if not self.write_authorize_playbook(force=True):
+                return False
+            if not self.write_materialize_playbook(force=False):
+                return False
+            if not self.write_finalize_playbook(force=False):
+                return False
+            if not self.write_destroy_playbook(force=True):
                 return False
 
             from cli.agents import ensure_agent_scaffold
             scaffold_agent = (self.config.get("agent") or {}).get("type") or "opencode"
             for path in ensure_agent_scaffold(self.rig_dir, agent_type=scaffold_agent):
                 created.append(path)
-            # Keep vars in sync for system.yml conditionals.
+            # Keep vars in sync for provision.yml conditionals.
             if self.vars_config is not None:
                 self.vars_config["coding_agent_type"] = scaffold_agent
                 vars_path = os.path.join(self.rig_dir, self.VARS_YAML)
                 if os.path.exists(vars_path) or write_vars:
-                    # Re-dump when we already wrote vars, or create/update coding_agent_type.
                     disk = self._load_vars_with_vault(vars_path) if os.path.exists(vars_path) else {}
                     if disk:
                         self.vars_config = {**disk, **self.vars_config}
                     self.vars_config["coding_agent_type"] = scaffold_agent
                     self._dump_vars(vars_path)
 
-            if system_missing and os.path.exists(system_path):
-                created.append(f"{self.RIG_DIR}/{self.SYSTEM_YAML}")
-            if workspace_missing and os.path.exists(workspace_path):
-                created.append(f"{self.RIG_DIR}/{self.WORKSPACE_YAML}")
-            if finalizers_missing and os.path.exists(finalizers_path):
-                created.append(f"{self.RIG_DIR}/{self.FINALIZERS_YAML}")
+            for stage, was_missing in missing.items():
+                if was_missing and os.path.exists(stage_paths[stage]):
+                    created.append(
+                        f"{self.RIG_DIR}/{os.path.basename(stage_paths[stage])}"
+                    )
 
             # Drop obsolete nested copies if present
             for obsolete in (
@@ -3337,51 +3500,73 @@ class ProjectConfig:
             print(f"Error initializing project: {e}")
             return False
 
-    def write_system_playbook(self, force: bool = False) -> bool:
-        """Write auto-generated .rig/system.yml when missing (or force)."""
+    def _migrate_legacy_playbook_files(self) -> None:
+        """Rename legacy flat playbooks to the verb lifecycle names when needed."""
+        mapping = (
+            ("system.yml", self.PROVISION_YAML),
+            ("services.yml", self.CONFIGURE_YAML),
+            ("authnz.yml", self.AUTHORIZE_YAML),
+            ("secrets.yml", self.AUTHORIZE_YAML),
+            ("authenticate.yml", self.AUTHORIZE_YAML),
+            ("workspace.yml", self.MATERIALIZE_YAML),
+            ("populate.yml", self.MATERIALIZE_YAML),
+            ("finalizers.yml", self.FINALIZE_YAML),
+            ("cleanup.yml", self.FINALIZE_YAML),
+            ("teardown.yml", self.DESTROY_YAML),
+            ("bootstrap.yml", self.PROVISION_YAML),
+            ("customize.yml", self.CONFIGURE_YAML),
+        )
+        for old_name, new_name in mapping:
+            if old_name == new_name:
+                continue
+            old_path = os.path.join(self.rig_dir, old_name)
+            new_path = os.path.join(self.rig_dir, new_name)
+            if os.path.isfile(old_path) and not os.path.exists(new_path):
+                try:
+                    os.rename(old_path, new_path)
+                except OSError:
+                    pass
+
+    def _write_playbook_file(self, filename: str, body: str, force: bool = False) -> bool:
         try:
             self._ensure_rig_dir()
-            path = os.path.join(self.rig_dir, self.SYSTEM_YAML)
+            path = os.path.join(self.rig_dir, filename)
             if os.path.exists(path) and not force:
                 return True
             with open(path, "w", encoding="utf-8") as handle:
-                handle.write(SYSTEM_PLAYBOOK.lstrip("\n"))
+                handle.write(body.lstrip("\n"))
             return True
         except Exception as e:
-            print(f"Error writing system playbook: {e}")
+            print(f"Error writing {filename}: {e}")
             return False
 
-    def write_workspace_playbook(self, force: bool = False) -> bool:
-        """Write .rig/workspace.yml when missing (or force)."""
-        try:
-            self._ensure_rig_dir()
-            path = os.path.join(self.rig_dir, self.WORKSPACE_YAML)
-            if os.path.exists(path) and not force:
-                return True
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(WORKSPACE_PLAYBOOK.lstrip("\n"))
-            return True
-        except Exception as e:
-            print(f"Error writing workspace playbook: {e}")
-            return False
+    def write_provision_playbook(self, force: bool = False) -> bool:
+        """Write auto-generated .rig/provision.yml when missing (or force)."""
+        return self._write_playbook_file(self.PROVISION_YAML, PROVISION_PLAYBOOK, force=force)
 
-    def write_finalizers_playbook(self, force: bool = False) -> bool:
-        """Write .rig/finalizers.yml when missing (or force)."""
-        try:
-            self._ensure_rig_dir()
-            path = os.path.join(self.rig_dir, self.FINALIZERS_YAML)
-            if os.path.exists(path) and not force:
-                return True
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(FINALIZERS_PLAYBOOK.lstrip("\n"))
-            return True
-        except Exception as e:
-            print(f"Error writing finalizers playbook: {e}")
-            return False
+    def write_configure_playbook(self, force: bool = False) -> bool:
+        """Write .rig/configure.yml when missing (or force)."""
+        return self._write_playbook_file(self.CONFIGURE_YAML, CONFIGURE_PLAYBOOK, force=force)
+
+    def write_authorize_playbook(self, force: bool = False) -> bool:
+        """Write auto-generated .rig/authorize.yml when missing (or force)."""
+        return self._write_playbook_file(self.AUTHORIZE_YAML, AUTHORIZE_PLAYBOOK, force=force)
+
+    def write_materialize_playbook(self, force: bool = False) -> bool:
+        """Write .rig/materialize.yml when missing (or force)."""
+        return self._write_playbook_file(self.MATERIALIZE_YAML, MATERIALIZE_PLAYBOOK, force=force)
+
+    def write_finalize_playbook(self, force: bool = False) -> bool:
+        """Write .rig/finalize.yml when missing (or force)."""
+        return self._write_playbook_file(self.FINALIZE_YAML, FINALIZE_PLAYBOOK, force=force)
+
+    def write_destroy_playbook(self, force: bool = False) -> bool:
+        """Write auto-generated .rig/destroy.yml when missing (or force)."""
+        return self._write_playbook_file(self.DESTROY_YAML, DESTROY_PLAYBOOK, force=force)
 
     def write_init_playbook(self) -> bool:
-        """Back-compat alias for write_system_playbook."""
-        return self.write_system_playbook(force=True)
+        """Back-compat alias for write_provision_playbook."""
+        return self.write_provision_playbook(force=True)
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value with dot notation support"""
@@ -3760,8 +3945,10 @@ class Workspace:
 
         if not project.save(write_vars=False):
             return False
-        # Refresh auto-generated system.yml so provider CLI tasks match repos.
-        if not project.write_system_playbook(force=True):
+        # Refresh auto-generated playbooks so provider CLI / secrets tasks match.
+        if not project.write_provision_playbook(force=True):
+            return False
+        if not project.write_authorize_playbook(force=True):
             return False
 
         print(f"Initialized environment '{workspace_name}' at {self.path}")
@@ -3998,8 +4185,11 @@ class AnsibleManager:
     def __init__(self, project_config: Optional["ProjectConfig"] = None):
         self.project_config: Optional["ProjectConfig"] = project_config
         self.playbook_path: Optional[str] = None
-        self.workspace_playbook_path: Optional[str] = None
-        self.finalizers_playbook_path: Optional[str] = None
+        self.configure_playbook_path: Optional[str] = None
+        self.authorize_playbook_path: Optional[str] = None
+        self.materialize_playbook_path: Optional[str] = None
+        self.finalize_playbook_path: Optional[str] = None
+        self.destroy_playbook_path: Optional[str] = None
         self.inventory_path: Optional[str] = None
         self.vault_password: Optional[str] = None
         self.extra_vars: Dict[str, Any] = {}
@@ -4020,12 +4210,43 @@ class AnsibleManager:
                 print("Warning: Could not load project config, using defaults")
                 self.project_config.init()
 
-            # Playbook paths come from root rig.yml (system / workspace / finalizers).
+            # Playbook paths from root rig.yml lifecycle stages.
             project_dir = self.project_config.project_dir
             playbooks = self.project_config.config.get("playbooks") or {}
-            system_rel = playbooks.get("system") or f".rig/{ProjectConfig.SYSTEM_YAML}"
-            workspace_rel = playbooks.get("workspace") or f".rig/{ProjectConfig.WORKSPACE_YAML}"
-            finalizers_rel = playbooks.get("finalizers") or f".rig/{ProjectConfig.FINALIZERS_YAML}"
+
+            def _stage_rel(stage: str, filename: str, *legacy_keys: str) -> str:
+                if playbooks.get(stage):
+                    return playbooks[stage]
+                for key in legacy_keys:
+                    if playbooks.get(key):
+                        return playbooks[key]
+                return f".rig/{filename}"
+
+            provision_rel = _stage_rel(
+                "provision", ProjectConfig.PROVISION_YAML, "system", "bootstrap"
+            )
+            configure_rel = _stage_rel(
+                "configure", ProjectConfig.CONFIGURE_YAML, "services", "customize"
+            )
+            authorize_rel = _stage_rel(
+                "authorize",
+                ProjectConfig.AUTHORIZE_YAML,
+                "authnz",
+                "secrets",
+                "authenticate",
+            )
+            materialize_rel = _stage_rel(
+                "materialize",
+                ProjectConfig.MATERIALIZE_YAML,
+                "workspace",
+                "populate",
+            )
+            finalize_rel = _stage_rel(
+                "finalize", ProjectConfig.FINALIZE_YAML, "finalizers", "cleanup"
+            )
+            destroy_rel = _stage_rel(
+                "destroy", ProjectConfig.DESTROY_YAML, "teardown"
+            )
             inventory_rel = (
                 self.project_config.config.get("inventory")
                 or f".rig/inventory.yml"
@@ -4034,9 +4255,12 @@ class AnsibleManager:
             def _resolve(rel: str) -> str:
                 return rel if os.path.isabs(rel) else os.path.join(project_dir, rel)
 
-            self.playbook_path = _resolve(system_rel)
-            self.workspace_playbook_path = _resolve(workspace_rel)
-            self.finalizers_playbook_path = _resolve(finalizers_rel)
+            self.playbook_path = _resolve(provision_rel)
+            self.configure_playbook_path = _resolve(configure_rel)
+            self.authorize_playbook_path = _resolve(authorize_rel)
+            self.materialize_playbook_path = _resolve(materialize_rel)
+            self.finalize_playbook_path = _resolve(finalize_rel)
+            self.destroy_playbook_path = _resolve(destroy_rel)
             self.inventory_path = _resolve(inventory_rel)
             self.vault_password = self.project_config.vault_password
 
@@ -4184,50 +4408,46 @@ class AnsibleManager:
             return False
 
     def setup_playbook(self, custom_tasks: Optional[list] = None) -> bool:
-        """Ensure system/workspace playbooks exist; optional custom tasks become workspace.yml."""
+        """Ensure lifecycle playbooks exist; optional custom tasks become materialize.yml."""
         try:
             if self.project_config is None:
                 print("Error: project_config is not set")
                 return False
 
-            # system.yml is auto-generated — refresh so playbook fixes ship on apply/create.
-            if not self.project_config.write_system_playbook(force=True):
+            # Managed playbooks — refresh so fixes ship on apply/create.
+            if not self.project_config.write_provision_playbook(force=True):
+                return False
+            if not self.project_config.write_configure_playbook(force=False):
+                return False
+            if not self.project_config.write_authorize_playbook(force=True):
+                return False
+            if not self.project_config.write_destroy_playbook(force=True):
                 return False
 
-            playbooks = self.project_config.config.get("playbooks") or {}
-            system_rel = playbooks.get("system") or f".rig/{ProjectConfig.SYSTEM_YAML}"
-            workspace_rel = playbooks.get("workspace") or f".rig/{ProjectConfig.WORKSPACE_YAML}"
-            project_dir = self.project_config.project_dir
-            system_path = (
-                system_rel if os.path.isabs(system_rel)
-                else os.path.join(project_dir, system_rel)
-            )
-            workspace_path = (
-                workspace_rel if os.path.isabs(workspace_rel)
-                else os.path.join(project_dir, workspace_rel)
-            )
+            if not self.configure(self.project_config.project_dir):
+                return False
 
             if custom_tasks:
+                materialize_path = self.materialize_playbook_path
+                if not materialize_path:
+                    return False
                 playbook = [{
-                    'name': 'Configure workspace',
+                    'name': 'Materialize workspace',
                     'hosts': 'remote_vm',
                     'gather_facts': False,
                     'remote_user': 'root',
                     'tasks': custom_tasks,
                 }]
-                with open(workspace_path, 'w', encoding='utf-8') as handle:
+                with open(materialize_path, 'w', encoding='utf-8') as handle:
                     yaml.dump(playbook, handle, default_flow_style=False, sort_keys=False)
-                # One-off / test runs execute the workspace playbook directly.
-                self.playbook_path = workspace_path
-                self.workspace_playbook_path = workspace_path
+                # One-off / test runs execute the materialize playbook directly.
+                self.playbook_path = materialize_path
             else:
-                if not self.project_config.write_workspace_playbook(force=False):
+                if not self.project_config.write_materialize_playbook(force=False):
                     return False
-                self.playbook_path = system_path
-                self.workspace_playbook_path = workspace_path
 
-            print(f"✓ System playbook: {system_path}")
-            print(f"✓ Workspace playbook: {workspace_path}")
+            print(f"✓ Provision playbook: {self.playbook_path}")
+            print(f"✓ Materialize playbook: {self.materialize_playbook_path}")
             return True
         except Exception as e:
             print(f"Error creating playbook: {e}")
@@ -4323,7 +4543,7 @@ class AnsibleManager:
     ) -> bool:
         """Run system.yml then workspace.yml when both are configured."""
         paths = []
-        for path in (self.playbook_path, self.workspace_playbook_path):
+        for path in (self.playbook_path, self.materialize_playbook_path):
             if path and os.path.exists(path) and path not in paths:
                 paths.append(path)
         if not paths:
@@ -4391,14 +4611,19 @@ class AnsibleManager:
                 shared_vars,
                 os.path.join(tmp_dir, "vars.yml"),
             )
-            cmd.extend(["-e", f"@{filtered_shared}"])
-            vars_path = filtered_shared
+            if filtered_shared:
+                cmd.extend(["-e", f"@{filtered_shared}"])
+                vars_path = filtered_shared
         if os.path.exists(identity_vars):
             filtered_identity = write_filtered_vars_copy(
                 identity_vars,
                 os.path.join(tmp_dir, os.path.basename(identity_vars)),
             )
-            cmd.extend(["-e", f"@{filtered_identity}"])
+            # Wraps-only identity files filter to empty; skip -e @file (Ansible
+            # rejects empty extra-vars files as invalid dictionaries).
+            if filtered_identity:
+                cmd.extend(["-e", f"@{filtered_identity}"])
+                vars_path = filtered_identity
 
         # Runtime rig_* context (and caller extras) after vars.yml so they win.
         if extra_vars:

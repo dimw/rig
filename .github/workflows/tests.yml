@@ -89,11 +89,15 @@ jobs:
         run: python scripts/coverage_badge.py >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        if: always()
+        uses: codecov/codecov-action@v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
           flags: unit-tests
-          name: codecov-coverage
+          name: unit-tests
+          fail_ci_if_error: true
+          verbose: true
 
   integration-tests:
     name: Integration Tests

@@ -67,10 +67,12 @@ def test_provision_runs_playbooks_in_order(tmp_path):
         except OSError:
             pass
 
-    assert len(calls) == 2
+    assert len(calls) == 4
     assert calls[0]["stream"] is True
-    assert calls[0]["path"].endswith("system.yml")
-    assert calls[1]["path"].endswith("workspace.yml")
+    assert calls[0]["path"].endswith("provision.yml")
+    assert calls[1]["path"].endswith("configure.yml")
+    assert calls[2]["path"].endswith("authorize.yml")
+    assert calls[3]["path"].endswith("materialize.yml")
 
 
 def test_apply_playbooks_workspace_only_by_default(tmp_path):
@@ -99,12 +101,12 @@ def test_apply_playbooks_workspace_only_by_default(tmp_path):
             assert env.apply_playbooks(
                 project_dir=str(project_dir),
                 stream=False,
-                playbooks=("workspace",),
+                playbooks=("materialize",),
             ) is True
             assert env.apply_playbooks(
                 project_dir=str(project_dir),
                 stream=False,
-                playbooks=("system",),
+                playbooks=("provision",),
             ) is True
     finally:
         try:
@@ -113,17 +115,18 @@ def test_apply_playbooks_workspace_only_by_default(tmp_path):
             pass
 
     assert len(calls) == 2
-    assert calls[0].endswith("workspace.yml")
-    assert calls[1].endswith("system.yml")
+    assert calls[0].endswith("materialize.yml")
+    assert calls[1].endswith("provision.yml")
 
 
-def test_apply_help_mentions_system(capsys):
+def test_apply_help_mentions_lifecycle_flags(capsys):
     with pytest.raises(SystemExit) as caught:
         main(["apply", "--help"])
     assert caught.value.code == 0
     help_text = capsys.readouterr().out
-    assert "--system" in help_text
-    assert "workspace" in help_text.lower()
+    assert "--provision" in help_text
+    assert "--authorize" in help_text
+    assert "--materialize" in help_text.lower()
 
 
 def test_apply_command_defaults_to_workspace():
@@ -144,11 +147,15 @@ def test_apply_command_defaults_to_workspace():
 
         assert main(["apply"]) == 0
         kwargs = instance.apply_playbooks.call_args.kwargs
-        assert kwargs["playbooks"] == ("workspace",)
+        assert kwargs["playbooks"] == ("authorize", "materialize")
 
-        assert main(["apply", "--system"]) == 0
+        assert main(["apply", "--provision"]) == 0
         kwargs = instance.apply_playbooks.call_args.kwargs
-        assert kwargs["playbooks"] == ("system",)
+        assert kwargs["playbooks"] == ("provision", "configure", "authorize")
+
+        assert main(["apply", "--authorize"]) == 0
+        kwargs = instance.apply_playbooks.call_args.kwargs
+        assert kwargs["playbooks"] == ("authorize",)
 
 
 def _attach_ssh_command(captured_cmd):
@@ -299,7 +306,7 @@ def test_run_all_playbooks_logs_command(tmp_path, capsys):
 
     err = capsys.readouterr().err
     assert "ansible-playbook" in err
-    assert "system.yml" in err
+    assert "provision.yml" in err
     assert "@" in err  # -e @vars.yml
 
 

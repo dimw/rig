@@ -87,6 +87,29 @@ def test_bootstrap_and_unlock(tmp_path, monkeypatch):
     assert wraps_after[SHARED_DATA_KEY_VAR] == shared_before
 
 
+def test_write_filtered_vars_copy_skips_wraps_only(tmp_path):
+    from cli.vault_keys import write_filtered_vars_copy
+
+    src = tmp_path / "vars.mlewk.yml"
+    src.write_text(
+        'rig_identity_data_key: "rig1$aaa$bbb$ccc"\n'
+        'rig_shared_data_key: "rig1$ddd$eee$fff"\n'
+    )
+    assert write_filtered_vars_copy(str(src), str(tmp_path / "out.yml")) is None
+
+    src.write_text(
+        'rig_identity_data_key: "rig1$aaa$bbb$ccc"\n'
+        "github_pat: !vault |\n"
+        "          $ANSIBLE_VAULT;1.2;AES256;personal\n"
+        "          deadbeef\n"
+    )
+    out = write_filtered_vars_copy(str(src), str(tmp_path / "out2.yml"))
+    assert out is not None
+    text = open(out, encoding="utf-8").read()
+    assert "github_pat" in text
+    assert "rig_identity_data_key" not in text
+
+
 def test_unlock_skips_prompt_when_tmp_keys_present(tmp_path, monkeypatch):
     monkeypatch.setenv("RIG_CONFIG", str(tmp_path / "cfg"))
     project = tmp_path / "ws"
@@ -114,8 +137,8 @@ def test_snapshot_hash_skips_identity_vars(tmp_path):
     (project / "rig.yml").write_text("kind: workspace\n")
     (rig / "vars.yml").write_text("x: 1\n")
     (rig / "vars.alice.yml").write_text('rig_identity_data_key: "rig1$x"\n')
-    (rig / "workspace.yml").write_text("---\n")
+    (rig / "materialize.yml").write_text("---\n")
     paths = [os.path.basename(p) for p in iter_workspace_hash_paths(str(project))]
     assert "vars.yml" in paths
     assert "vars.alice.yml" not in paths
-    assert "workspace.yml" in paths
+    assert "materialize.yml" in paths

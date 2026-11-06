@@ -354,11 +354,12 @@ def test_ensure_vscode_browser_password_generates_once(tmp_path, monkeypatch):
     assert len(created[0][1]) >= 32
 
 
-def test_system_playbook_uses_vscode_browser_password():
-    from cli.remote_dev import SYSTEM_PLAYBOOK
+def test_authnz_playbook_uses_vscode_browser_password():
+    from cli.remote_dev import AUTHORIZE_PLAYBOOK, PROVISION_PLAYBOOK
 
-    assert "vscode_browser_password" in SYSTEM_PLAYBOOK
-    assert "changeme" not in SYSTEM_PLAYBOOK
+    assert "vscode_browser_password" in AUTHORIZE_PLAYBOOK
+    assert "changeme" not in AUTHORIZE_PLAYBOOK
+    assert "vscode_browser_password" not in PROVISION_PLAYBOOK
 
 
 def test_read_vscode_browser_password_missing(tmp_path):

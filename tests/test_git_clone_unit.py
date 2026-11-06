@@ -30,8 +30,8 @@ class TestProjectConfigGitSetup:
         # Verify directory structure
         assert os.path.exists(project_config.rig_dir)
         assert os.path.exists(os.path.join(workspace_dir, 'rig.yml'))
-        assert os.path.exists(os.path.join(project_config.rig_dir, 'system.yml'))
-        assert os.path.exists(os.path.join(project_config.rig_dir, 'workspace.yml'))
+        assert os.path.exists(os.path.join(project_config.rig_dir, 'provision.yml'))
+        assert os.path.exists(os.path.join(project_config.rig_dir, 'materialize.yml'))
         assert os.path.exists(os.path.join(project_config.rig_dir, 'vars.yml'))
         assert not os.path.exists(os.path.join(project_config.rig_dir, 'rig.yml'))
         assert not os.path.exists(os.path.join(project_config.rig_dir, 'setup.yml'))

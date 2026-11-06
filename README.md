@@ -1,5 +1,6 @@
 [![Tests](https://github.com/mystack-cloud/rig/actions/workflows/tests.yml/badge.svg)](https://github.com/mystack-cloud/rig/actions/workflows/tests.yml)
-[![Coverage](https://img.shields.io/badge/coverage-69%25-yellow)](https://github.com/mystack-cloud/rig/actions/workflows/tests.yml)
+[![codecov](https://codecov.io/gh/mystack-cloud/rig/graph/badge.svg)](https://codecov.io/gh/mystack-cloud/rig)
+[![Unit coverage](https://codecov.io/gh/mystack-cloud/rig/branch/master/graph/badge.svg?flag=unit-tests)](https://codecov.io/gh/mystack-cloud/rig/flags/unit-tests)
 
 # rig
 
@@ -56,9 +57,12 @@ Chosen at `rig init` (`editor` in `rig.yml`), or override with `--editor`. Local
 rig.yml                 # workspace manifest (vm, agent, playbooks, repos)
 .gitignore              # adds .rig/collections, roles, inventory (via init)
 .rig/
-  system.yml            # auto-generated; code-server + agent + gh/glab
-  workspace.yml         # custom; clone repos / project setup
-  finalizers.yml        # custom; release off-VM resources before destroy
+  provision.yml         # managed; create base environment (cached)
+  configure.yml         # user; image/service customizations (cached)
+  authorize.yml         # managed; inject credentials (never snapshotted)
+  materialize.yml       # user; populate /workspace after authorize
+  finalize.yml          # user; destruction hooks before managed destroy
+  destroy.yml           # managed; teardown system resources before VM delete
   vars.yml              # Shared Ansible vars (vaulted with shared data key)
   vars.<identity>.yml   # Personal secrets + master-key wraps (committed)
   requirements.yml      # Galaxy collections/roles
@@ -83,9 +87,12 @@ agent:
   type: opencode          # or claude | cursor
 editor: code                  # code | code-insiders | cursor | codium
 playbooks:
-  system: .rig/system.yml
-  workspace: .rig/workspace.yml
-  finalizers: .rig/finalizers.yml
+  provision: .rig/provision.yml
+  configure: .rig/configure.yml
+  authorize: .rig/authorize.yml
+  materialize: .rig/materialize.yml
+  finalize: .rig/finalize.yml
+  destroy: .rig/destroy.yml
 ```
 
 Firewall modes:
@@ -109,20 +116,35 @@ Remote project files live under `/workspace` (not `/root`).
 init  →  create  →  attach | dev | apply  →  destroy
               ↓
          snapshots (reuse on next create)
+
+create playbooks:
+  provision → configure → [snapshot] → authorize → materialize
+
+destroy playbooks:
+  finalize → destroy → (delete VM / firewall / key)
 ```
 
-| Stage | What happens |
+| Stage | File | Owner | Meaning |
+| --- | --- | --- | --- |
+| **provision** | `provision.yml` | managed | Create managed base environment |
+| **configure** | `configure.yml` | user | Apply user image/service customizations (cached) |
+| **authorize** | `authorize.yml` | managed | Inject credentials and establish access |
+| **materialize** | `materialize.yml` | user | Populate `/workspace` |
+| **finalize** | `finalize.yml` | user | Run user-defined destruction hooks |
+| **destroy** | `destroy.yml` | managed | Remove managed environment (before CLI deletes VM) |
+
+| Command | What happens |
 | --- | --- |
-| **init** | Scaffold `rig.yml` + `.rig/`. Collect Hetzner creds (`~/.rig/config`), repo PATs, agent choice/key. Idempotent: fills missing files only. |
-| **create** | Boot VM (base image, or matching snapshot). Run `system.yml` then `workspace.yml` unless skipped by snapshot. Snapshot after each. Attach agent TTY unless `--no-attach`. |
-| **apply** | Re-run `workspace.yml` (or `--system`) on an existing env. |
+| **init** | Scaffold `rig.yml` + `.rig/`. Collect Hetzner creds, repo PATs, agent choice/key. |
+| **create** | Boot VM (base/system snapshot). Run provision → configure → authorize → materialize. Snapshot after **configure** only. |
+| **apply** | Default: authorize → materialize. Flags: `--provision` / `--configure` / `--authorize` / `--materialize`. |
 | **attach** | SSH TTY into `opencode` / `claude` / Cursor `agent` on `/workspace`. |
 | **dev** | Open VS Code/Cursor via Remote-SSH on `/workspace` (or `--browser` for code-server). |
-| **destroy** | Run `finalizers.yml`, then delete VM / firewall / SSH key. |
+| **destroy** | Run finalize → destroy playbooks, then delete VM / firewall / SSH key. |
+
+Put secret-free installs in `configure.yml` (cached). Put clone/setup that needs credentials in `materialize.yml`.
 
 Last env name is remembered in `/tmp/.rig/last-env` (used when `name` is omitted).
-
-After you leave an agent TTY, rig captures the printed session / resume id (when the agent prints one) under `/tmp/.rig/sessions/<env>`. A later bare `rig attach` reopens that session (`--session` for OpenCode, `--resume` for Claude Code / Cursor). Pass `-c` / `--session` / `--resume` to override.
 
 After you leave an agent TTY, rig captures the printed session / resume id (when the agent prints one) under `/tmp/.rig/sessions/<env>`. A later bare `rig attach` reopens that session (`--session` for OpenCode, `--resume` for Claude Code / Cursor). Pass `-c` / `--session` / `--resume` to override.
 
@@ -130,13 +152,24 @@ After you leave an agent TTY, rig captures the printed session / resume id (when
 
 | Boot source | Skips |
 | --- | --- |
-| `workspace-{name}-{hash}` | system + workspace |
-| `rig-{version}` | system only |
+| `rig-{version}-{hash}` | provision + configure (`authorize` + `materialize` still run) |
 | base image | nothing |
 
-Workspace hash covers durable inputs (`rig.yml`, `workspace.yml`, `finalizers.yml`, vars, agent scaffolds, requirements). Excludes `inventory.yml`, auto-generated `system.yml`, and Galaxy installs.
+**System hash** = var map (`coding_agent_type`, `git_providers`, `code_server_*`, `workspace_root`) + `provision.yml` + `configure.yml`. Secrets and `authorize.yml` / `materialize.yml` are not included.
 
-Override with `--force-playbooks` / `--force-system` / `--force-workspace`. Clear with `rig cache clear` or `rig cache --system clear`.
+Override with `--force-playbooks` / `--force-system` (force provision+configure) / `--force-workspace` (force materialize).
+
+`rig cache list|clear` — show snapshots (and for clear, confirm then delete):
+
+| Flags | Selection |
+| --- | --- |
+| (default) | unused system (+ legacy workspace) for current project |
+| `--system` | system only |
+| `--workspace` | legacy workspace snapshots (current project) |
+| `--all` | include current (not only unused) |
+| `--all --system` / `--all --workspace` | all of that kind, including current |
+
+`-y` skips the confirmation on clear.
 
 ## CLI
 
@@ -146,12 +179,12 @@ Global: `-v` debug · `-q` warnings/errors only · `--version`
 | --- | --- | --- |
 | `init` | | Interactive scaffold |
 | `create` | `[--name]` `[--type]` `[--availability-zone]` `[--image]` `[--no-attach]` `[--force-playbooks\|--force-system\|--force-workspace]` | VM defaults from `rig.yml`; flags override. `--region` aliases `--availability-zone`. |
-| `apply` | `[name]` `[--system]` | Default: workspace playbook |
+| `apply` | `[name]` `[--provision\|--configure\|--authorize\|--materialize]` | Default: authorize then materialize |
 | `attach` | `[name]` `[-c\|--continue]` `[-s\|--session ID]` `[--resume [ID]]` `[-- …agent args]` | Reopens last remembered session by default; flags override |
 | `dev` | `[name]` `[--path /workspace]` `[--browser]` `[--editor code\|cursor\|…]` | Remote-SSH by default; `--editor` overrides `editor` in `rig.yml` |
 | `list` | | Lists envs, or `No remote environments` |
-| `destroy` | `[name …]` | Runs finalizers first; multi-name OK |
-| `cache` | `[--system] clear` | Delete workspace or system snapshots |
+| `destroy` | `[name …]` | Runs finalize then destroy playbooks first; multi-name OK |
+| `cache` | `list\|clear` `[--system\|--workspace] [--all] [-y]` | List or clear; unused by default, `--all` includes current |
 | `vars encrypt` | `[--stdin-name VAR]` `[--personal]` | Vault into shared or identity vars (after master-key unlock) |
 | `vars decrypt` | `[VAR]` | Decrypt from shared or identity vars |
 | `vars list` | | List vaulted names (`shared` / `identity`) |

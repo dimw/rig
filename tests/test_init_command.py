@@ -131,7 +131,7 @@ def test_interactive_init_in_git_subfolder_writes_locally(tmp_path):
     )
 
     assert (apps_web / "rig.yml").is_file()
-    assert (apps_web / ".rig" / "workspace.yml").is_file()
+    assert (apps_web / ".rig" / "materialize.yml").is_file()
     assert not (monorepo / "rig.yml").exists()
     assert not (monorepo / ".rig").exists()
     manifest = yaml.safe_load((apps_web / "rig.yml").read_text())
@@ -141,7 +141,7 @@ def test_interactive_init_in_git_subfolder_writes_locally(tmp_path):
 
 
 def test_discover_projects_in_parent_folder(tmp_path):
-    root = tmp_path / "workspace"
+    root = tmp_path / "materialize"
     _git_init(root / "alpha", "https://github.com/org/alpha.git")
     _git_init(root / "beta")
     (root / "notes.txt").write_text("ignore me\n")
@@ -234,9 +234,9 @@ def test_cli_init_uses_interactive_flow(tmp_path, monkeypatch):
     assert main(["init"]) == 0
     assert (repo / "rig.yml").is_file()
     assert not (repo / ".rig" / "rig.yml").exists()
-    assert (repo / ".rig" / "system.yml").is_file()
-    assert (repo / ".rig" / "workspace.yml").is_file()
-    assert (repo / ".rig" / "finalizers.yml").is_file()
+    assert (repo / ".rig" / "provision.yml").is_file()
+    assert (repo / ".rig" / "materialize.yml").is_file()
+    assert (repo / ".rig" / "finalize.yml").is_file()
     assert not (tmp_path / "rig.yml").exists()
 
 
@@ -278,16 +278,18 @@ def test_interactive_init_stores_encrypted_git_pat(tmp_path):
     assert "vscode_browser_password: !vault |" in shared_text
     clone_repos = yaml.load(shared_text, Loader=_VarsLoader)["git"]["clone_repos"]
     assert clone_repos[0]["password_var"] == "rig_git_pat"
-    assert (rig / ".rig" / "system.yml").is_file()
-    assert (rig / ".rig" / "workspace.yml").is_file()
+    assert (rig / ".rig" / "provision.yml").is_file()
+    assert (rig / ".rig" / "materialize.yml").is_file()
     assert not (rig / ".rig" / "setup.yml").exists()
     assert not (rig / ".rig" / "init.yml").exists()
     assert not (rig / ".rig" / "rig.yml").exists()
     manifest = yaml.safe_load((rig / "rig.yml").read_text())
-    assert manifest["playbooks"]["system"] == ".rig/system.yml"
-    assert manifest["playbooks"]["workspace"] == ".rig/workspace.yml"
-    assert manifest["playbooks"]["finalizers"] == ".rig/finalizers.yml"
-    assert (rig / ".rig" / "finalizers.yml").is_file()
+    assert manifest["playbooks"]["provision"] == ".rig/provision.yml"
+    assert manifest["playbooks"]["materialize"] == ".rig/materialize.yml"
+    assert manifest["playbooks"]["authorize"] == ".rig/authorize.yml"
+    assert manifest["playbooks"]["finalize"] == ".rig/finalize.yml"
+    assert (rig / ".rig" / "authorize.yml").is_file()
+    assert (rig / ".rig" / "finalize.yml").is_file()
     assert manifest["agent"]["credentials_var"] == "coding_agent_api_key"
 
 
@@ -317,7 +319,7 @@ def test_interactive_init_scaffolds_opencode_agent_files(tmp_path):
     assert config["model"].startswith("opencode/")
     assert "free" in config["model"] or config["model"] == "opencode/big-pickle"
     assert "CODING_AGENT_API_KEY" not in json.dumps(config)
-    system = (rig / ".rig" / "system.yml").read_text()
+    system = (rig / ".rig" / "provision.yml").read_text()
     assert "Install OpenCode CLI" in system
     assert 'test -s "$bin"' in system
     assert "creates:" not in system.split("Install OpenCode CLI", 1)[1].split("Symlink OpenCode", 1)[0]
@@ -348,7 +350,7 @@ def test_interactive_init_scaffolds_claude_agent_files(tmp_path):
     assert (rig / ".rig" / "AGENTS.md").is_file()
     assert (rig / ".rig" / ".claude" / "settings.json").is_file()
     assert (rig / ".rig" / ".claude" / "mcp.json").is_file()
-    system = (rig / ".rig" / "system.yml").read_text()
+    system = (rig / ".rig" / "provision.yml").read_text()
     assert "Deploy AGENTS.md as Claude global rules" in system
 
 
@@ -375,10 +377,12 @@ def test_interactive_init_scaffolds_cursor_agent_files(tmp_path):
     assert vars_data["coding_agent_type"] == "cursor"
     assert (rig / ".rig" / ".cursor" / "cli-config.json").is_file()
     assert (rig / ".rig" / ".cursor" / "mcp.json").is_file()
-    system = (rig / ".rig" / "system.yml").read_text()
+    system = (rig / ".rig" / "provision.yml").read_text()
     assert "Install Cursor CLI" in system
-    assert "CURSOR_API_KEY" in system
     assert "coding_agent_type == \"cursor\"" in system
+    authnz = (rig / ".rig" / "authorize.yml").read_text()
+    assert "CURSOR_API_KEY" in authnz
+    assert "CURSOR_API_KEY" not in system
 
 
 def test_interactive_init_converts_ssh_remote_to_https_and_stores_pat(tmp_path):
@@ -480,7 +484,7 @@ def test_init_records_git_providers_for_system_playbook(tmp_path):
     assert vars_data["git_providers"] == ["github", "gitlab"]
     manifest = yaml.safe_load((root / "rig.yml").read_text())
     assert manifest["git_providers"] == ["github", "gitlab"]
-    system = (root / ".rig" / "system.yml").read_text()
+    system = (root / ".rig" / "provision.yml").read_text()
     assert "Install GitHub CLI (gh)" in system
     assert "Install GitLab CLI (glab)" in system
     assert "'github' in (git_providers | default([]))" in system
@@ -644,8 +648,8 @@ def test_reinit_adds_missing_files_only(tmp_path):
     )
 
     custom_workspace = "# custom workspace playbook\n"
-    (rig / ".rig" / "workspace.yml").write_text(custom_workspace)
-    (rig / ".rig" / "system.yml").unlink()
+    (rig / ".rig" / "materialize.yml").write_text(custom_workspace)
+    (rig / ".rig" / "provision.yml").unlink()
     # Leave a legacy nested file that reinit should remove
     (rig / ".rig" / "setup.yml").write_text("bootstrap: {}\n")
 
@@ -657,8 +661,8 @@ def test_reinit_adds_missing_files_only(tmp_path):
         data_key_path=str(data_key),
     )
 
-    assert (rig / ".rig" / "system.yml").is_file()
-    assert (rig / ".rig" / "workspace.yml").read_text() == custom_workspace
+    assert (rig / ".rig" / "provision.yml").is_file()
+    assert (rig / ".rig" / "materialize.yml").read_text() == custom_workspace
     assert not (rig / ".rig" / "setup.yml").exists()
     assert not (rig / ".rig" / "rig.yml").exists()
 
