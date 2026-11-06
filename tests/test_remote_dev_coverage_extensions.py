@@ -992,6 +992,11 @@ class TestRemoteDevEnvironmentMore:
         env.vm_ip = "10.0.0.1"
         env.ssh_key_name = "att-k"
         Path(f"/tmp/{env.ssh_key_name}").write_text("k", encoding="utf-8")
+        # Mocked SSH never writes the attach log; seed it so parse_session_id runs
+        # (fresh CI runners have no leftover /tmp/.rig/attach-*.log).
+        attach_log = Path("/tmp/.rig") / "attach-att.log"
+        attach_log.parent.mkdir(parents=True, exist_ok=True)
+        attach_log.write_text("session sess-1\n", encoding="utf-8")
 
         cfg = ProjectConfig(str(tmp_path))
         cfg.init(name="att", agent_type="opencode")
