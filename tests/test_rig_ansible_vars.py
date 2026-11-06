@@ -29,7 +29,7 @@ def test_build_rig_ansible_vars_includes_core_fields(tmp_path):
     )
     env.vm_ip = "203.0.113.10"
     env.vm_id = 42
-    env.boot_source = "system"
+    env.boot_source = "provision"
 
     vars_out = build_rig_ansible_vars(env, cfg, action="create")
     assert vars_out["rig_env_name"] == "dev-abc123"
@@ -41,7 +41,7 @@ def test_build_rig_ansible_vars_includes_core_fields(tmp_path):
     assert vars_out["rig_agent_type"] == "opencode"
     assert vars_out["rig_workspace_root"] == "/workspace"
     assert vars_out["rig_action"] == "create"
-    assert vars_out["rig_boot_source"] == "system"
+    assert vars_out["rig_boot_source"] == "provision"
     assert vars_out["rig_project_dir"] == str(tmp_path)
     assert all(key.startswith("rig_") for key in vars_out)
 
@@ -68,7 +68,7 @@ def test_run_one_playbook_injects_rig_vars_as_json(tmp_path):
 
     with patch("cli.remote_dev.subprocess.run", side_effect=fake_run):
         assert manager._run_one_playbook(
-            str(tmp_path / ".rig" / "workspace.yml"),
+            str(tmp_path / ".rig" / "materialize.yml"),
             stream=False,
         )
 
@@ -109,7 +109,7 @@ def test_apply_playbooks_sets_rig_vars(tmp_path):
         ):
             assert env.apply_playbooks(
                 project_dir=str(tmp_path),
-                playbooks=("workspace",),
+                playbooks=("materialize",),
                 action="apply",
                 stream=False,
             )

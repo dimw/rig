@@ -7,6 +7,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import cli.vault_keys as vault_keys
 from cli.config import RigConfig
 from cli.snapshots import iter_workspace_hash_paths
 from cli.vault_keys import (
@@ -21,20 +22,7 @@ from cli.vault_keys import (
     unlock_data_keys,
     unwrap_with_master_key,
     wrap_with_master_key,
-    PERSONAL_DATA_KEY_PATH,
-    SHARED_DATA_KEY_PATH,
 )
-
-
-@pytest.fixture(autouse=True)
-def _clear_tmp_keys():
-    for path in (PERSONAL_DATA_KEY_PATH, SHARED_DATA_KEY_PATH, "/tmp/.rig/.data-key"):
-        if os.path.exists(path):
-            os.unlink(path)
-    yield
-    for path in (PERSONAL_DATA_KEY_PATH, SHARED_DATA_KEY_PATH, "/tmp/.rig/.data-key"):
-        if os.path.exists(path):
-            os.unlink(path)
 
 
 def test_sanitize_and_resolve_identity(tmp_path, monkeypatch):
@@ -76,17 +64,70 @@ def test_bootstrap_and_unlock(tmp_path, monkeypatch):
     wraps = read_wrap_fields(id_file)
     assert IDENTITY_DATA_KEY_VAR in wraps
     assert SHARED_DATA_KEY_VAR in wraps
+    identity_before = wraps[IDENTITY_DATA_KEY_VAR]
+    shared_before = wraps[SHARED_DATA_KEY_VAR]
 
-    # Clear tmp and unlock again
-    for path in (PERSONAL_DATA_KEY_PATH, SHARED_DATA_KEY_PATH, "/tmp/.rig/.data-key"):
-        os.unlink(path)
+    # Clear tmp and unlock again — wraps must stay the same.
+    for path in (
+        vault_keys.PERSONAL_DATA_KEY_PATH,
+        vault_keys.SHARED_DATA_KEY_PATH,
+        vault_keys.DEFAULT_DATA_KEY_PATH,
+    ):
+        if os.path.exists(path):
+            os.unlink(path)
     unlock_data_keys(
         str(project),
         identity="tester",
         master_key="master-one",
     )
-    assert read_data_key_file(PERSONAL_DATA_KEY_PATH)
-    assert read_data_key_file(SHARED_DATA_KEY_PATH)
+    assert read_data_key_file(vault_keys.PERSONAL_DATA_KEY_PATH)
+    assert read_data_key_file(vault_keys.SHARED_DATA_KEY_PATH)
+    wraps_after = read_wrap_fields(id_file)
+    assert wraps_after[IDENTITY_DATA_KEY_VAR] == identity_before
+    assert wraps_after[SHARED_DATA_KEY_VAR] == shared_before
+
+
+def test_write_filtered_vars_copy_skips_wraps_only(tmp_path):
+    from cli.vault_keys import write_filtered_vars_copy
+
+    src = tmp_path / "vars.mlewk.yml"
+    src.write_text(
+        'rig_identity_data_key: "rig1$aaa$bbb$ccc"\n'
+        'rig_shared_data_key: "rig1$ddd$eee$fff"\n'
+    )
+    assert write_filtered_vars_copy(str(src), str(tmp_path / "out.yml")) is None
+
+    src.write_text(
+        'rig_identity_data_key: "rig1$aaa$bbb$ccc"\n'
+        "github_pat: !vault |\n"
+        "          $ANSIBLE_VAULT;1.2;AES256;personal\n"
+        "          deadbeef\n"
+    )
+    out = write_filtered_vars_copy(str(src), str(tmp_path / "out2.yml"))
+    assert out is not None
+    text = open(out, encoding="utf-8").read()
+    assert "github_pat" in text
+    assert "rig_identity_data_key" not in text
+
+
+def test_unlock_skips_prompt_when_tmp_keys_present(tmp_path, monkeypatch):
+    monkeypatch.setenv("RIG_CONFIG", str(tmp_path / "cfg"))
+    project = tmp_path / "ws"
+    project.mkdir()
+    (project / "rig.yml").write_text("kind: workspace\n")
+    answers = iter(["tester"])
+    secrets = iter(["master-one", "master-one"])
+    bootstrap_identity_keys(
+        str(project),
+        input_fn=lambda _p: next(answers),
+        secret_fn=lambda _p: next(secrets),
+        config=RigConfig(path=str(tmp_path / "cfg")),
+    )
+
+    def boom(_prompt):
+        raise AssertionError("master key should not be prompted when tmp keys exist")
+
+    unlock_data_keys(str(project), identity="tester", secret_fn=boom)
 
 
 def test_snapshot_hash_skips_identity_vars(tmp_path):
@@ -96,8 +137,8 @@ def test_snapshot_hash_skips_identity_vars(tmp_path):
     (project / "rig.yml").write_text("kind: workspace\n")
     (rig / "vars.yml").write_text("x: 1\n")
     (rig / "vars.alice.yml").write_text('rig_identity_data_key: "rig1$x"\n')
-    (rig / "workspace.yml").write_text("---\n")
+    (rig / "materialize.yml").write_text("---\n")
     paths = [os.path.basename(p) for p in iter_workspace_hash_paths(str(project))]
     assert "vars.yml" in paths
     assert "vars.alice.yml" not in paths
-    assert "workspace.yml" in paths
+    assert "materialize.yml" in paths

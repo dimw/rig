@@ -122,3 +122,32 @@ def setup_test_env(request):
             os.environ.pop(key, None)
         else:
             os.environ[key] = value
+
+
+@pytest.fixture(autouse=True)
+def _isolate_rig_tmp_keys(tmp_path, monkeypatch):
+    """
+    Point ephemeral data-key paths at a per-test directory.
+
+    Never unlink the developer's real ``/tmp/.rig/.{personal,shared,data}-key``
+    files — those keep an unlocked session alive across reboot boundaries.
+    """
+    key_dir = tmp_path / "rig-tmp-keys"
+    key_dir.mkdir(exist_ok=True)
+    personal = str(key_dir / ".personal-data-key")
+    shared = str(key_dir / ".shared-data-key")
+    legacy = str(key_dir / ".data-key")
+
+    monkeypatch.setattr("cli.vault_keys.TMP_RIG_DIR", str(key_dir))
+    monkeypatch.setattr("cli.vault_keys.PERSONAL_DATA_KEY_PATH", personal)
+    monkeypatch.setattr("cli.vault_keys.SHARED_DATA_KEY_PATH", shared)
+    monkeypatch.setattr("cli.vault_keys.DEFAULT_DATA_KEY_PATH", legacy)
+
+    try:
+        import cli.encrypt as encrypt_mod
+
+        monkeypatch.setattr(encrypt_mod, "PERSONAL_DATA_KEY_PATH", personal)
+        monkeypatch.setattr(encrypt_mod, "SHARED_DATA_KEY_PATH", shared)
+        monkeypatch.setattr(encrypt_mod, "DEFAULT_DATA_KEY_PATH", legacy)
+    except ImportError:
+        pass

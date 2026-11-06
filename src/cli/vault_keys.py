@@ -401,13 +401,23 @@ def filter_wrap_fields_from_yaml_text(content: str) -> str:
     return cleaned.lstrip("\n")
 
 
-def write_filtered_vars_copy(src_path: str, dest_path: str) -> str:
-    """Copy vars file without wrap fields for ansible -e @file."""
+def write_filtered_vars_copy(src_path: str, dest_path: str) -> Optional[str]:
+    """
+    Copy vars file without wrap fields for ansible ``-e @file``.
+
+    Returns ``None`` when the filtered file would be empty (wraps-only identity
+    file). Ansible rejects an empty ``-e @file`` with "could not be made into
+    a dictionary".
+    """
     if not os.path.exists(src_path):
-        return src_path
+        return None
     with open(src_path, "r", encoding="utf-8") as handle:
         content = handle.read()
-    filtered = filter_wrap_fields_from_yaml_text(content)
+    filtered = filter_wrap_fields_from_yaml_text(content).strip()
+    if not filtered:
+        return None
+    if not filtered.endswith("\n"):
+        filtered = filtered + "\n"
     directory = os.path.dirname(dest_path)
     if directory:
         os.makedirs(directory, mode=0o700, exist_ok=True)

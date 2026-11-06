@@ -142,8 +142,8 @@ class TestWorkspaceGitClone:
         project_config = ProjectConfig(test_workspace_dir)
         project_config.init(name=unique_env_name, ansible_enabled=True)
         assert os.path.exists(os.path.join(test_workspace_dir, 'rig.yml'))
-        assert os.path.exists(os.path.join(project_config.rig_dir, 'system.yml'))
-        assert os.path.exists(os.path.join(project_config.rig_dir, 'workspace.yml'))
+        assert os.path.exists(os.path.join(project_config.rig_dir, 'provision.yml'))
+        assert os.path.exists(os.path.join(project_config.rig_dir, 'materialize.yml'))
 
         env = RemoteDevEnvironment(name=unique_env_name)
         env.name = unique_env_name

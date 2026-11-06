@@ -64,6 +64,10 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
+    # OIDC upload when Codecov GitHub App is linked; token used when present.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -89,11 +93,17 @@ jobs:
         run: python scripts/coverage_badge.py >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        if: always()
+        uses: codecov/codecov-action@v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          use_oidc: true
           files: ./coverage.xml
           flags: unit-tests
-          name: codecov-coverage
+          name: unit-tests
+          # Do not fail Unit Tests on upload/auth issues (pytest is the gate).
+          fail_ci_if_error: false
+          verbose: true
 
   integration-tests:
     name: Integration Tests

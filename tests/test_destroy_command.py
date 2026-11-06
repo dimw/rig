@@ -111,7 +111,7 @@ def test_cleanup_resolves_then_deletes():
     env.manager.delete_firewall.return_value = True
     env.manager.delete_ssh_key.return_value = True
 
-    with patch.object(env, "run_finalizers_playbook", return_value=True) as finalizers_pb:
+    with patch.object(env, "run_destroy_playbooks", return_value=True) as finalizers_pb:
         env.cleanup(project_dir="/tmp/project")
 
     finalizers_pb.assert_called_once_with(project_dir="/tmp/project", stream=True)
@@ -140,20 +140,20 @@ def test_cleanup_runs_finalizers_playbook_before_vm_delete(tmp_path):
         return True
 
     env.manager.delete_vm.side_effect = fake_delete_vm
-    with patch.object(env, "run_finalizers_playbook", side_effect=fake_finalizers_pb), patch.object(
+    with patch.object(env, "run_destroy_playbooks", side_effect=fake_finalizers_pb), patch.object(
         env, "resolve_resources", return_value=True
     ):
         env.cleanup(project_dir=str(tmp_path))
 
-    assert order == ["finalizers_playbook", "delete_vm"]
+    assert order == ["finalizers_playbook", "delete_vm"]  # finalize→destroy then VM
 
 
-def test_run_finalizers_playbook_invokes_ansible(tmp_path):
+def test_run_destroy_playbooks_invokes_ansible(tmp_path):
     from cli.remote_dev import ProjectConfig
 
     cfg = ProjectConfig(str(tmp_path))
     assert cfg.init(name="ws", agent_type="opencode")
-    assert (tmp_path / ".rig" / "finalizers.yml").is_file()
+    assert (tmp_path / ".rig" / "finalize.yml").is_file()
 
     with open("/tmp/dev-pb-key", "w", encoding="utf-8") as handle:
         handle.write("fake-key\n")
@@ -166,12 +166,15 @@ def test_run_finalizers_playbook_invokes_ansible(tmp_path):
             instance.configure.return_value = True
             instance.setup_bootstrap.return_value = True
             instance._run_one_playbook.return_value = True
-            instance.finalizers_playbook_path = str(tmp_path / ".rig" / "finalizers.yml")
+            instance.finalize_playbook_path = str(tmp_path / ".rig" / "finalize.yml")
+            instance.destroy_playbook_path = str(tmp_path / ".rig" / "destroy.yml")
             ansible_cls.return_value = instance
-            assert env.run_finalizers_playbook(project_dir=str(tmp_path)) is True
+            assert env.run_destroy_playbooks(project_dir=str(tmp_path)) is True
             instance.setup_bootstrap.assert_called_once()
-            instance._run_one_playbook.assert_called_once()
-            assert instance._run_one_playbook.call_args.args[0].endswith("finalizers.yml")
+            assert instance._run_one_playbook.call_count == 2
+            paths = [c.args[0] for c in instance._run_one_playbook.call_args_list]
+            assert paths[0].endswith("finalize.yml")
+            assert paths[1].endswith("destroy.yml")
     finally:
         try:
             os.remove("/tmp/dev-pb-key")

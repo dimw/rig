@@ -242,7 +242,7 @@ def _cmd_attach(args: argparse.Namespace) -> int:
 
 
 def _cmd_apply(args: argparse.Namespace) -> int:
-    """Re-run Ansible playbooks on an existing environment (default: workspace.yml)."""
+    """Re-run lifecycle playbooks on an existing environment."""
     _load_credentials()
     hetzner_token = os.getenv('HETZNER_CLOUD_API_TOKEN')
     if not hetzner_token:
@@ -255,10 +255,39 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     )
     if not name:
         log.error("Environment name is required (no last environment remembered)")
-        log.info("Usage: rig apply [name] [--system]")
+        log.info(
+            "Usage: rig apply [name] "
+            "[--provision|--configure|--authorize|--materialize]"
+        )
         return 1
 
-    playbooks = ("system",) if getattr(args, "system", False) else ("workspace",)
+    # Legacy flag aliases.
+    want_provision = getattr(args, "provision", False) or getattr(args, "system", False)
+    want_configure = getattr(args, "configure", False)
+    want_authorize = getattr(args, "authorize", False) or getattr(args, "authnz", False)
+    want_materialize = getattr(args, "materialize", False)
+
+    selected = []
+    if want_provision:
+        selected.extend(["provision", "configure", "authorize"])
+    if want_configure and "configure" not in selected:
+        selected.append("configure")
+    if want_authorize and not want_provision and not want_configure and not want_materialize:
+        selected = ["authorize"]
+    elif want_authorize and "authorize" not in selected:
+        selected.append("authorize")
+    if want_materialize:
+        if "authorize" not in selected and not want_provision:
+            selected.append("authorize")
+        if "materialize" not in selected:
+            selected.append("materialize")
+    if not selected:
+        # Default apply: re-authorize then materialize.
+        selected = ["authorize", "materialize"]
+
+    # Preserve lifecycle order.
+    order = ("provision", "configure", "authorize", "materialize")
+    playbooks = tuple(stage for stage in order if stage in selected)
 
     storage_manager = None
     try:
@@ -284,7 +313,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             project_dir=os.getcwd(),
             stream=True,
             playbooks=playbooks,
-            soft_fail_workspace=False,
+            soft_fail_materialize=False,
             action="apply",
         )
         return 0 if ok else 1
@@ -419,11 +448,120 @@ def _cmd_destroy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cache_scope_flags(args: argparse.Namespace) -> tuple:
+    """Return ``(include_system, include_workspace)`` from CLI flags."""
+    want_system = bool(getattr(args, "system", False))
+    want_workspace = bool(getattr(args, "workspace", False))
+    if want_system and not want_workspace:
+        return True, False
+    if want_workspace and not want_system:
+        return False, True
+    # Neither or both → both kinds.
+    return True, True
+
+
+def _cache_select_snapshots(
+    images,
+    args: argparse.Namespace,
+) -> tuple:
+    """
+    Build ``(keep, targets, label)`` for cache list/clear.
+
+    Without ``--all``: targets are unused (current omitted into keep).
+    With ``--all``: targets include current; keep is empty.
+    ``--system`` / ``--workspace`` narrow the kind(s).
+    """
+    from cli.snapshots import (
+        describe_snapshot,
+        find_unused_snapshots,
+        package_version,
+        system_content_hash,
+        system_hash_inputs_from_project,
+        workspace_content_hash,
+    )
+
+    include_system, include_workspace = _cache_scope_flags(args)
+    clear_all = bool(getattr(args, "all", False))
+
+    scope_bits = []
+    if include_system:
+        scope_bits.append("system")
+    if include_workspace:
+        scope_bits.append("workspace")
+    scope = "+".join(scope_bits) or "snapshot"
+
+    if clear_all:
+        targets = []
+        for image in images:
+            if image.get("type") and image.get("type") != "snapshot":
+                continue
+            meta = describe_snapshot(image)
+            kind = meta.get("kind")
+            if kind == "system" and include_system:
+                meta["reason"] = "all"
+                targets.append(meta)
+            elif kind == "workspace" and include_workspace:
+                # --all --workspace: every workspace snapshot (any project).
+                # Narrow to current project name when rig.yml is available.
+                meta["reason"] = "all"
+                targets.append(meta)
+        # Optionally restrict workspace --all to the current project when possible.
+        if include_workspace and not include_system:
+            project_dir = os.getcwd()
+            project = ProjectConfig(project_dir)
+            if project.load() and project.config:
+                ws_name = project.config.get("name") or os.path.basename(
+                    project_dir.rstrip(os.sep)
+                )
+                from cli.snapshots import sanitize_snapshot_token
+
+                cur = sanitize_snapshot_token(str(ws_name), max_len=40)
+                targets = [
+                    m
+                    for m in targets
+                    if m.get("kind") != "workspace" or m.get("workspace") == cur
+                ]
+        label = f"{scope} snapshot(s)"
+        return [], targets, label
+
+    project_dir = os.getcwd()
+    project = ProjectConfig(project_dir)
+    if not project.load() or not project.config:
+        raise RuntimeError(
+            f"No rig.yml in {project_dir}; cannot determine current snapshots "
+            "(use --all to include every matching snapshot)"
+        )
+
+    workspace_name = project.config.get("name") or os.path.basename(
+        project_dir.rstrip(os.sep)
+    )
+    workspace_hash = workspace_content_hash(project_dir, project=project)
+    version = package_version()
+    sys_inputs = system_hash_inputs_from_project(project)
+    system_hash = system_content_hash(
+        project=project,
+        var_map=sys_inputs.get("var_map"),
+        project_dir=project_dir,
+    )
+
+    split = find_unused_snapshots(
+        images,
+        current_version=version,
+        current_system_hash=system_hash,
+        current_workspace_name=str(workspace_name),
+        current_workspace_hash=workspace_hash,
+        include_system=include_system,
+        include_workspace=include_workspace,
+    )
+    label = f"unused {scope} snapshot(s)"
+    return split["keep"], split["unused"], label
+
+
 def _cmd_cache(args: argparse.Namespace) -> int:
-    """Clear Hetzner snapshots for the current workspace or system playbook."""
+    """List or clear Hetzner snapshots (unused by default; --all includes current)."""
     action = getattr(args, "action", None) or "clear"
-    if action != "clear":
-        log.error("Unknown cache action %r (supported: clear)", action)
+    if action not in ("clear", "list"):
+        log.error("Unknown cache action %r (supported: clear, list)", action)
         return 1
 
     _load_credentials()
@@ -434,18 +572,7 @@ def _cmd_cache(args: argparse.Namespace) -> int:
         )
         return 1
 
-    from cli.snapshots import filter_snapshots
-
-    clear_system = bool(getattr(args, "system", False))
-    workspace_name = None
-    if not clear_system:
-        project = ProjectConfig(os.getcwd())
-        if not project.load() or not project.config:
-            log.error("No rig.yml in %s; cannot determine workspace snapshots", os.getcwd())
-            return 1
-        workspace_name = project.config.get("name") or os.path.basename(
-            os.getcwd().rstrip(os.sep)
-        )
+    assume_yes = bool(getattr(args, "yes", False))
 
     try:
         env = RemoteDevEnvironment(storage_manager=None)
@@ -454,30 +581,82 @@ def _cmd_cache(args: argparse.Namespace) -> int:
         log.error("Failed to list snapshots: %s", exc)
         return 1
 
-    targets = filter_snapshots(
-        images,
-        system=clear_system,
-        workspace_name=None if clear_system else str(workspace_name),
-    )
-    if not targets:
-        scope = "system" if clear_system else f"workspace '{workspace_name}'"
-        log.info("No %s snapshots to clear", scope)
+    try:
+        keep, targets, label = _cache_select_snapshots(images, args)
+    except RuntimeError as exc:
+        log.error("%s", exc)
+        return 1
+
+    if keep:
+        log.info("Current (kept) snapshot(s):")
+        for meta in keep:
+            log.info(
+                "  %s (id=%s)",
+                meta.get("description"),
+                meta.get("id"),
+            )
+
+    if not targets and not keep:
+        log.info("No matching snapshots")
         return 0
 
+    if targets:
+        heading = "All" if getattr(args, "all", False) else "Unused"
+        log.info("%s (%s):", heading, len(targets))
+        for meta in targets:
+            reason = meta.get("reason")
+            if reason and reason != "all":
+                log.info(
+                    "  %s (id=%s) — %s",
+                    meta.get("description"),
+                    meta.get("id"),
+                    reason,
+                )
+            else:
+                log.info(
+                    "  %s (id=%s)",
+                    meta.get("description"),
+                    meta.get("id"),
+                )
+    elif action == "list":
+        log.info("No unused snapshots")
+        return 0
+
+    if action == "list":
+        return 0
+
+    if not targets:
+        log.info("No %s to clear", label)
+        return 0
+
+    if not assume_yes:
+        try:
+            answer = input(
+                f"Delete {len(targets)} {label}? [y/N]: "
+            ).strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            log.info("Cancelled")
+            return 0
+
     failures = []
-    for image in targets:
-        image_id = image.get("id")
-        description = image.get("description") or image_id
+    deleted = 0
+    for meta in targets:
+        image_id = meta.get("id")
+        description = meta.get("description") or image_id
         if image_id is None:
             continue
         log.info("Deleting snapshot %s (id=%s)", description, image_id)
         if not env.manager.delete_image(str(image_id)):
             failures.append(str(description))
+        else:
+            deleted += 1
 
     if failures:
         log.error("Failed to delete: %s", ", ".join(failures))
         return 1
-    log.info("Cleared %s snapshot(s)", len(targets))
+    log.info("Cleared %s %s", deleted, label)
     return 0
 
 
@@ -586,24 +765,27 @@ def main(argv=None):
     create_parser.add_argument(
         "--force-playbooks",
         action="store_true",
-        help="Run system.yml and workspace.yml even when booting from a matching snapshot",
+        help=(
+            "Run provision/configure/materialize even when booting from a "
+            "matching snapshot (authorize always runs)"
+        ),
     )
     create_parser.add_argument(
         "--force-system",
         action="store_true",
-        help="Run system.yml even when booting from a system/workspace snapshot",
+        help="Force provision+configure even when booting from a system snapshot",
     )
     create_parser.add_argument(
         "--force-workspace",
         action="store_true",
-        help="Run workspace.yml even when booting from a matching workspace snapshot",
+        help="Force materialize even when it would otherwise be skipped",
     )
 
     apply_parser = subparsers.add_parser(
         "apply",
         help=(
-            "Re-run Ansible playbooks on an existing env "
-            "(default: workspace.yml; use --system for system.yml)"
+            "Re-run lifecycle playbooks on an existing env "
+            "(default: authorize then materialize)"
         ),
     )
     apply_parser.add_argument(
@@ -617,9 +799,35 @@ def main(argv=None):
         help="Environment name (kept for compatibility)",
     )
     apply_parser.add_argument(
+        "--provision",
+        action="store_true",
+        help="Run provision → configure → authorize",
+    )
+    apply_parser.add_argument(
+        "--configure",
+        action="store_true",
+        help="Run configure.yml",
+    )
+    apply_parser.add_argument(
+        "--authorize",
+        action="store_true",
+        help="Run authorize.yml only (re-apply credentials)",
+    )
+    apply_parser.add_argument(
+        "--materialize",
+        action="store_true",
+        help="Run authorize then materialize (or materialize with other flags)",
+    )
+    # Legacy aliases
+    apply_parser.add_argument(
         "--system",
         action="store_true",
-        help="Run .rig/system.yml instead of workspace.yml",
+        help=argparse.SUPPRESS,
+    )
+    apply_parser.add_argument(
+        "--authnz",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
 
     attach_parser = subparsers.add_parser(
@@ -705,30 +913,49 @@ def main(argv=None):
 
     cache_parser = subparsers.add_parser(
         "cache",
-        help="Manage Hetzner snapshots created after system/workspace playbooks",
+        help="Manage Hetzner snapshots created after the configure (build) stage",
         description=(
-            "Clear VM snapshots. "
-            "'rig cache clear' removes workspace snapshots for the current project; "
-            "'rig cache --system clear' removes system.yml snapshots (rig-{version})."
+            "List or clear VM snapshots after showing them. "
+            "Default clear: unused only (older version or different hash); "
+            "current snapshots are kept. "
+            "--all includes current. "
+            "--system / --workspace narrow the kind "
+            "(combine with or without --all)."
         ),
     )
     cache_parser.add_argument(
         "--system",
         action="store_true",
-        help="Target system.yml snapshots (rig-{version}) instead of workspace snapshots",
+        help="Only system snapshots (rig-{version}-{hash})",
+    )
+    cache_parser.add_argument(
+        "--workspace",
+        action="store_true",
+        help="Only workspace snapshots (workspace-{name}-{hash}) for this project",
+    )
+    cache_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Include current snapshots (default omits them / unused only)",
+    )
+    cache_parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Delete without confirmation (clear only)",
     )
     cache_parser.add_argument(
         "action",
         nargs="?",
         default="clear",
-        choices=["clear"],
-        help="Cache action (default: clear)",
+        choices=["clear", "list"],
+        help="list = show only; clear = list, confirm, delete (default: clear)",
     )
 
     destroy_parser = subparsers.add_parser(
         "destroy",
         help=(
-            "Destroy remote environments (runs playbooks.finalizers first; "
+            "Destroy remote environments (runs finalize then destroy playbooks first; "
             "uses last env if name omitted)"
         ),
     )

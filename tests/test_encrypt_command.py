@@ -259,13 +259,13 @@ def test_decrypt_uses_default_data_key_without_flag(tmp_path):
 
 
 def test_decrypt_requires_data_key(tmp_path):
+    # Per-test key dir from conftest is empty; no wraps in project either.
     with pytest.raises(ValueError, match="not found|Missing key wraps|No data keys"):
-        # Force require_wraps path by clearing tmp keys and pointing at empty project
-        for name in (".personal-data-key", ".shared-data-key", ".data-key"):
-            pth = f"/tmp/.rig/{name}"
-            if os.path.exists(pth):
-                os.unlink(pth)
-        interactive_decrypt(path=str(tmp_path / "missing-key"), name="x", project_dir=str(tmp_path / "empty"))
+        interactive_decrypt(
+            path=str(tmp_path / "missing-key"),
+            name="x",
+            project_dir=str(tmp_path / "empty"),
+        )
 
 
 def test_help_lists_encrypt_and_stdin_name(capsys):
@@ -354,11 +354,12 @@ def test_ensure_vscode_browser_password_generates_once(tmp_path, monkeypatch):
     assert len(created[0][1]) >= 32
 
 
-def test_system_playbook_uses_vscode_browser_password():
-    from cli.remote_dev import SYSTEM_PLAYBOOK
+def test_authnz_playbook_uses_vscode_browser_password():
+    from cli.remote_dev import AUTHORIZE_PLAYBOOK, PROVISION_PLAYBOOK
 
-    assert "vscode_browser_password" in SYSTEM_PLAYBOOK
-    assert "changeme" not in SYSTEM_PLAYBOOK
+    assert "vscode_browser_password" in AUTHORIZE_PLAYBOOK
+    assert "changeme" not in AUTHORIZE_PLAYBOOK
+    assert "vscode_browser_password" not in PROVISION_PLAYBOOK
 
 
 def test_read_vscode_browser_password_missing(tmp_path):
