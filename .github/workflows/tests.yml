@@ -86,7 +86,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          pytest tests/ -v -m "not e2e" --cov=src --cov-report=term-missing --cov-report=xml --ignore=tests/test_real_e2e_integration.py --ignore=tests/test_real_e2e_storage.py --ignore=tests/test_hetzner_storage.py
+          pytest tests/ -v -m "not e2e" --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --ignore=tests/test_real_e2e_integration.py --ignore=tests/test_real_e2e_storage.py --ignore=tests/test_hetzner_storage.py
 
       - name: Report coverage
         if: always()
