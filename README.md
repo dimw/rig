@@ -1,6 +1,5 @@
 [![Tests](https://github.com/mystack-cloud/rig/actions/workflows/tests.yml/badge.svg)](https://github.com/mystack-cloud/rig/actions/workflows/tests.yml)
 [![codecov](https://codecov.io/gh/mystack-cloud/rig/graph/badge.svg)](https://codecov.io/gh/mystack-cloud/rig)
-[![Unit coverage](https://codecov.io/gh/mystack-cloud/rig/branch/master/graph/badge.svg?flag=unit-tests)](https://codecov.io/gh/mystack-cloud/rig/flags/unit-tests)
 
 # rig
 
