@@ -52,12 +52,19 @@ class TestBasicStorageOperations:
             mock_s3 = MagicMock()
             mock_boto.return_value = mock_s3
             mock_s3.create_bucket.return_value = True
+            mock_s3.head_bucket.return_value = {}
 
             storage = StorageManager()
             result = storage.create_bucket(test_bucket_name)
 
             assert result is True
             mock_s3.create_bucket.assert_called_once_with(Bucket=test_bucket_name)
+            mock_s3.head_bucket.assert_called_with(Bucket=test_bucket_name)
+            # Hetzner needs path-style + SigV4 on every client (create and upload).
+            kwargs = mock_boto.call_args.kwargs
+            assert kwargs.get("region_name") == "fsn1"
+            assert kwargs["config"].s3.get("addressing_style") == "path"
+            assert kwargs["config"].signature_version == "s3v4"
 
     def test_upload_file_command(self, hetzner_token, s3_credentials, test_bucket_name, test_file):
         """Test upload file command"""

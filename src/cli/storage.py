@@ -3,9 +3,10 @@ Storage management for the CLI using Hetzner S3-compatible object storage
 """
 
 import os
-import json
-from typing import Optional, Dict, List
+import time
+from typing import Optional, Dict
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from cli import log
@@ -32,99 +33,91 @@ class StorageManager:
             raise ValueError(
                 "S3 credentials missing. Please set HETZNER_S3_ACCESS_KEY and HETZNER_S3_SECRET_KEY environment variables")
 
-    def _get_s3_client(self):
-        """Get S3 client configured for Hetzner Object Storage"""
-        # Use the pre-generated S3 credentials from environment variables
-        # Hetzner S3 uses HETZNER_S3_ACCESS_KEY and HETZNER_S3_SECRET_KEY
+    def _endpoint_region(self) -> str:
+        """Location id embedded in the Hetzner Object Storage endpoint hostname."""
+        url = (self.endpoint_url or "").lower()
+        for region in ("hel1", "fsn1", "nbg1"):
+            if region in url:
+                return region
+        return "fsn1"
 
-        # Hetzner Object Storage is region-agnostic for clients
-        # but the endpoint URL determines the physical location
-        s3_client = boto3.client(
-            's3',
-            endpoint_url=self.endpoint_url,
-            aws_access_key_id=self.s3_access_key,
-            aws_secret_access_key=self.s3_secret_key
+    def _s3_config(self) -> Config:
+        """
+        Hetzner Object Storage requires path-style URLs and SigV4.
+
+        Virtual-hosted style (``bucket.endpoint``) yields BadRequest / NoSuchBucket
+        on PutObject even right after a successful CreateBucket.
+        """
+        return Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+            # Object storage can be slow under load; avoid flaky short timeouts.
+            connect_timeout=10,
+            read_timeout=120,
+            retries={"max_attempts": 5, "mode": "standard"},
         )
-        return s3_client
+
+    def _get_s3_client(self):
+        """Get S3 client configured for Hetzner Object Storage."""
+        return boto3.client(
+            "s3",
+            endpoint_url=self.endpoint_url,
+            region_name=self._endpoint_region(),
+            aws_access_key_id=self.s3_access_key,
+            aws_secret_access_key=self.s3_secret_key,
+            config=self._s3_config(),
+        )
+
+    def _wait_for_bucket(self, s3_client, bucket_name: str, timeout_s: float = 30.0) -> bool:
+        """Poll until the bucket is visible to HeadBucket (eventual consistency)."""
+        deadline = time.time() + timeout_s
+        delay = 0.5
+        while time.time() < deadline:
+            try:
+                s3_client.head_bucket(Bucket=bucket_name)
+                return True
+            except ClientError as exc:
+                code = str(exc.response.get("Error", {}).get("Code", "") or "")
+                http = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 0)
+                # Not ready yet.
+                if code in ("404", "NoSuchBucket", "NotFound") or http in (404, 403):
+                    time.sleep(delay)
+                    delay = min(delay * 1.5, 3.0)
+                    continue
+                log.warning("HeadBucket for %r failed: %s", bucket_name, exc)
+                return False
+            except Exception as exc:
+                log.warning("HeadBucket for %r failed: %s", bucket_name, exc)
+                return False
+        log.warning("Timed out waiting for bucket %r to become ready", bucket_name)
+        return False
 
     def create_bucket(self, bucket_name: str, location: Optional[str] = None) -> bool:
         """Create a new bucket using Hetzner Object Storage"""
         try:
-            import requests
-            import time
-            import hashlib
-            import hmac
-
-            # For Hetzner S3, we need to use a direct HTTP PUT request
-            # to avoid boto3's automatic location constraint
-            # The endpoint URL determines the region
-
-            # Hetzner S3 requires the bucket to be created in the same region as the endpoint
-            # Extract region from endpoint (fsn1, hel1, nbg1)
-            endpoint_region = None
-            if 'hel1' in self.endpoint_url:
-                endpoint_region = 'hel1'
-            elif 'fsn1' in self.endpoint_url:
-                endpoint_region = 'fsn1'
-            elif 'nbg1' in self.endpoint_url:
-                endpoint_region = 'nbg1'
-
-            # Use requests for direct control over the request
-            url = f"{self.endpoint_url}/{bucket_name}"
-
-            # Generate signature for AWS S3 v4
-            # For bucket creation, we need to sign an empty PUT request
-            request_timestamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
-            canonical_uri = f"/{bucket_name}"
-            canonical_headers = f"host:{self.endpoint_url.replace('https://', '')}\n"
-            signed_headers = "host"
-            payload_hash = hashlib.sha256(b'').hexdigest()
-
-            canonical_request = f"PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-
-            # For Hetzner, we need to use the endpoint region for bucket creation
-            # but the client doesn't need region for operations
-            s3_client = boto3.client(
-                's3',
-                endpoint_url=self.endpoint_url,
-                region_name=endpoint_region,
-                aws_access_key_id=self.s3_access_key,
-                aws_secret_access_key=self.s3_secret_key
-            )
-
-            # Try creating without explicit LocationConstraint first
-            # If this fails with LocationConstraintConflict, the issue is that
-            # boto3's session has a default region that doesn't match the endpoint
+            s3_client = self._get_s3_client()
             try:
                 s3_client.create_bucket(Bucket=bucket_name)
                 log.debug("Created storage bucket %r", bucket_name)
-                # Wait a moment for bucket to be fully created (Hetzner S3 can have slight delay)
-                time.sleep(1)
-                return True
             except ClientError as create_error:
-                # If the error is about location constraint, try again with explicit region
-                error_msg = str(create_error)
-                if 'LocationConstraintConflict' in error_msg:
-                    # The endpoint region is correct, but boto3 is using a different region
-                    # We need to explicitly specify the region in the request
-                    s3_client = boto3.client(
-                        's3',
-                        endpoint_url=self.endpoint_url,
-                        region_name=endpoint_region,
-                        aws_access_key_id=self.s3_access_key,
-                        aws_secret_access_key=self.s3_secret_key,
-                        config=boto3.session.Config(signature_version='s3v4')
-                    )
+                error_code = create_error.response.get("Error", {}).get("Code", "")
+                # If bucket already exists, that's fine
+                if error_code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                    log.debug("Storage bucket %r already exists", bucket_name)
+                elif "LocationConstraintConflict" in str(create_error):
+                    # Retry once with the same client (path-style + region already set).
                     s3_client.create_bucket(Bucket=bucket_name)
                     log.debug(
                         "Created storage bucket %r (region %s)",
                         bucket_name,
-                        endpoint_region,
+                        self._endpoint_region(),
                     )
-                    # Wait a moment for bucket to be fully created
-                    time.sleep(1)
-                    return True
-                raise
+                else:
+                    raise
+
+            if not self._wait_for_bucket(s3_client, bucket_name):
+                return False
+            return True
 
         except ClientError as e:
             error_code = e.response.get('Error', {}).get('Code', '')
@@ -132,7 +125,8 @@ class StorageManager:
             # If bucket already exists, that's fine
             if error_code == 'BucketAlreadyOwnedByYou' or error_code == 'BucketAlreadyExists':
                 log.debug("Storage bucket %r already exists", bucket_name)
-                return True
+                s3_client = self._get_s3_client()
+                return self._wait_for_bucket(s3_client, bucket_name)
 
             log.warning("Could not create storage bucket: %s", e)
             return False
@@ -165,6 +159,10 @@ class StorageManager:
             log.debug("Uploaded %s -> %s/%s", file_path, bucket_name, object_name)
             return True
         except ClientError as e:
+            log.warning("Could not upload file: %s", e)
+            return False
+        except Exception as e:
+            # boto3 wraps some failures (e.g. S3UploadFailedError).
             log.warning("Could not upload file: %s", e)
             return False
 
@@ -201,6 +199,10 @@ class StorageManager:
             log.debug("Deleted %s/%s", bucket_name, object_name)
             return True
         except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            # Idempotent: missing key is fine; missing bucket is not.
+            if error_code in ("NoSuchKey", "404", "NotFound"):
+                return True
             log.warning("Could not delete storage object: %s", e)
             return False
 
@@ -219,7 +221,8 @@ class StorageManager:
         """Return information about the configured credentials"""
         token_part = self.hetzner_token or ""
         return {
-            "endpoint": self.endpoint_url,
-            "token_used": f"{'*' * (len(token_part) - 4)}{token_part[-4:] if len(token_part) > 4 else token_part}",
-            "credentials_expiration": "Temporary credentials generated by Hetzner"
+            "token_preview": f"{token_part[:8]}..." if len(token_part) > 8 else token_part,
+            "endpoint": self.endpoint_url or "",
+            "access_key_set": bool(self.s3_access_key),
+            "secret_key_set": bool(self.s3_secret_key),
         }
