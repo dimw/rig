@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + '/..')
 from cli.storage import StorageManager
 from cli.config import RigConfig
 from cli.encrypt import interactive_decrypt, interactive_encrypt
+from cli import DISTRIBUTION_NAME
 from cli import log as log
 from cli.last_env import clear_last_env, remember_last_env, resolve_env_name
 from cli.last_session import (
@@ -46,11 +47,11 @@ def _load_credentials() -> bool:
 # bind them separately so the type checker does not see a redefinition.
 try:
     from importlib.metadata import version as package_version
-    __version__ = package_version("rig")
+    __version__ = package_version(DISTRIBUTION_NAME)
 except ImportError:
     try:
         from importlib_metadata import version as package_version_fallback
-        __version__ = package_version_fallback("rig")
+        __version__ = package_version_fallback(DISTRIBUTION_NAME)
     except ImportError:
         __version__ = "0.1.0"
 

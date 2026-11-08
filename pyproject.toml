@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mystack-rig"
+dynamic = ["version"]
+authors = [
+  { name = "mystack-cloud" },
+]
+description = "Ephemeral remotes with full local parity for coding agents"
+readme = "README.md"
+requires-python = ">=3.7"
+keywords = ["remote-development", "coding-agents", "hetzner"]
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "requests>=2.25.0",
+  "ansible>=4.0.0",
+  "boto3>=1.26.0",
+  "PyYAML>=6.0",
+  "cryptography>=41.0.0",
+  "importlib-metadata>=4.0; python_version < '3.8'",
+]
+
+[project.urls]
+Homepage = "https://github.com/mystack-cloud/rig"
+Source = "https://github.com/mystack-cloud/rig"
+Issues = "https://github.com/mystack-cloud/rig/issues"
+
+[project.scripts]
+rig = "cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0"

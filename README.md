@@ -6,10 +6,12 @@
 Secure, fast, cost-efficient ephemeral remotes with full local parity—so coding agents and humans can develop and e2e-test for real.
 
 ```bash
-pip install .
+pip install mystack-rig
 rig init
 rig create
 ```
+
+The published project name is `mystack-rig` (the PyPI name `rig` belongs to another project). The command is still `rig`. From a checkout, `pip install .` installs the same command.
 
 ## Architecture
 
@@ -250,6 +252,10 @@ OpenCode without an API key uses free Zen models. With a key, config switches to
 ```bash
 python -m pytest tests/ -m "not requires_credentials"
 ```
+
+## Release
+
+Push a version tag to publish that version to PyPI. The package version is the tag without an optional leading `v` (`v0.2.0` publishes `0.2.0`). The workflow reads the GitHub Actions variable `PYPI_API_TOKEN` (a PyPI API token, including the `pypi-` prefix).
 
 ## License
 

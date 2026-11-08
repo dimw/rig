@@ -8,6 +8,8 @@ import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from cli import DISTRIBUTION_NAME
+
 SYSTEM_LABEL = "system"
 WORKSPACE_LABEL = "workspace"
 RIG_LABEL_KEY = "rig"
@@ -44,14 +46,14 @@ WORKSPACE_SNAPSHOT_VAR_KEYS: Tuple[str, ...] = (
 
 
 def package_version() -> str:
-    """Installed ``rig`` package version (fallback ``0.0.0``)."""
+    """Installed package version (fallback ``0.0.0``)."""
     try:
         from importlib.metadata import version as pkg_version
-        return pkg_version("rig")
+        return pkg_version(DISTRIBUTION_NAME)
     except Exception:
         try:
             from importlib_metadata import version as pkg_version_fallback
-            return pkg_version_fallback("rig")
+            return pkg_version_fallback(DISTRIBUTION_NAME)
         except Exception:
             return "0.0.0"
 
