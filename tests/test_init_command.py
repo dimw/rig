@@ -178,8 +178,11 @@ def test_interactive_init_selects_projects(tmp_path):
     manifest = yaml.safe_load((rig / "rig.yml").read_text())
     assert manifest["kind"] == "workspace"
     assert manifest["name"] == "rig"
-    assert manifest["vm"]["type"] == "cax11"
-    assert manifest["vm"]["availability_zone"] == "hel1"
+    assert manifest["host"]["provider"] == "hetzner"
+    assert manifest["host"]["type"] == "vm"
+    assert manifest["host"]["server_type"] == "cax11"
+    assert manifest["host"]["availability_zone"] == "hel1"
+    assert "vm" not in manifest
     assert {repo["name"] for repo in manifest["repos"]} == {"api", "rig"}
     api_entry = next(repo for repo in manifest["repos"] if repo["name"] == "api")
     assert api_entry["path"] == "../api"
