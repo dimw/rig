@@ -75,6 +75,61 @@ def test_provision_runs_playbooks_in_order(tmp_path):
     assert calls[3]["path"].endswith("materialize.yml")
 
 
+def test_playbook_lifecycle_line_hides_skip_and_apply_detail(tmp_path, capsys):
+    from cli import log as rig_log
+
+    project_dir = tmp_path / "ws"
+    project_dir.mkdir()
+    cfg = ProjectConfig(str(project_dir))
+    assert cfg.init(name="ws", agent_type="opencode")
+
+    env = RemoteDevEnvironment(name="ws-log")
+    env.vm_ip = "10.0.0.8"
+    env.ssh_key_name = "ws-log-key"
+    env.skip_playbooks = ("provision", "configure")
+    env.boot_source = "system"
+    env.boot_snapshot_description = "rig-0.1.1-abc"
+    real_key = "/tmp/ws-log-key"
+    with open(real_key, "w", encoding="utf-8") as handle:
+        handle.write("fake\n")
+
+    def fake_run_one(self, playbook_path, extra_vars=None, vault_password=None, stream=False):
+        return True
+
+    try:
+        rig_log.configure_logging()
+        capsys.readouterr()
+        with patch.object(AnsibleManager, "setup_bootstrap", return_value=True), patch.object(
+            AnsibleManager, "_run_one_playbook", fake_run_one
+        ):
+            assert env.provision(project_dir=str(project_dir), stream=True) is True
+        quiet = capsys.readouterr().err
+        assert "Skipping playbook" not in quiet
+        assert "Applying " not in quiet
+        assert "Playbooks complete" not in quiet
+        assert "Playbook succeeded" not in quiet
+        assert "Running authorize playbook" in quiet
+        assert quiet.count("Running authorize playbook") == 1
+        assert "/authorize.yml" in quiet
+        assert "Running materialize playbook" in quiet
+
+        rig_log.configure_logging(verbose=True)
+        capsys.readouterr()
+        with patch.object(AnsibleManager, "setup_bootstrap", return_value=True), patch.object(
+            AnsibleManager, "_run_one_playbook", fake_run_one
+        ):
+            assert env.provision(project_dir=str(project_dir), stream=True) is True
+        verbose = capsys.readouterr().err
+        assert "Skipping playbook" in verbose
+        assert "Applying authorize+materialize" in verbose
+    finally:
+        rig_log.configure_logging()
+        try:
+            os.remove(real_key)
+        except OSError:
+            pass
+
+
 def test_apply_playbooks_workspace_only_by_default(tmp_path):
     project_dir = tmp_path / "ws"
     project_dir.mkdir()
@@ -177,7 +232,10 @@ def _attach_ssh_command(captured_cmd):
     return captured_cmd
 
 
-def test_attach_to_agent_builds_ssh_tty_command(tmp_path):
+def test_attach_to_agent_builds_ssh_tty_command(tmp_path, capsys):
+    from cli import log as rig_log
+
+    rig_log.configure_logging()
     env = RemoteDevEnvironment(name="attach-demo")
     env.vm_ip = "203.0.113.10"
     env.ssh_key_name = "attach-demo"
@@ -192,11 +250,55 @@ def test_attach_to_agent_builds_ssh_tty_command(tmp_path):
         code = env.attach_to_agent(agent_type="claude")
 
     assert code == 0
+    err = capsys.readouterr().err
+    assert "Attaching to claude on attach-demo" in err
+    assert "203.0.113.10" not in err
     ssh_cmd = _attach_ssh_command(captured["cmd"])
     assert ssh_cmd[0] == "ssh" or ssh_cmd[0].endswith("/ssh")
     assert "-tt" in ssh_cmd
     assert "root@203.0.113.10" in ssh_cmd
+    assert "LogLevel=ERROR" in ssh_cmd
     assert any("exec claude" in part for part in ssh_cmd)
+
+    rig_log.configure_logging(verbosity=1)
+    try:
+        with patch("cli.remote_dev.subprocess.run", side_effect=fake_run):
+            assert env.attach_to_agent(agent_type="claude") == 0
+        ssh_cmd = _attach_ssh_command(captured["cmd"])
+        assert "LogLevel=INFO" in ssh_cmd
+    finally:
+        rig_log.configure_logging()
+
+
+def test_open_ssh_starts_a_workspace_shell():
+    env = RemoteDevEnvironment(name="dev-ssh")
+    env.vm_ip = "203.0.113.20"
+    env.ssh_key_name = "dev-ssh-key"
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return MagicMock(returncode=0)
+
+    with patch("cli.remote_dev.subprocess.run", side_effect=fake_run):
+        assert env.open_ssh() == 0
+    ssh_cmd = _attach_ssh_command(captured["cmd"])
+    remote = ssh_cmd[-1]
+    assert "cd /workspace" in remote
+    assert "exec bash -l" in remote
+    assert "root@203.0.113.20" in ssh_cmd
+
+    with patch("cli.remote_dev.subprocess.run", side_effect=fake_run):
+        assert env.open_ssh(remote_command="uptime") == 0
+    ssh_cmd = _attach_ssh_command(captured["cmd"])
+    assert ssh_cmd[-1] == "uptime"
+
+    bare = RemoteDevEnvironment(name="no-ip")
+    assert bare.open_ssh() == 1
+    with patch("cli.remote_dev.RemoteDevEnvironment._run_attach_ssh", side_effect=FileNotFoundError):
+        assert env.open_ssh() == 1
+    with patch("cli.remote_dev.RemoteDevEnvironment._run_attach_ssh", side_effect=KeyboardInterrupt):
+        assert env.open_ssh() == 130
 
 
 def test_attach_to_agent_forwards_extra_args():
@@ -547,7 +649,7 @@ def test_default_playbook_log_is_lifecycle_until_a_task_fails(tmp_path, monkeypa
     assert manager._run_one_playbook(str(playbook), stream=True) is True
     streamed = capsys.readouterr()
     assert streamed.out == ""
-    assert "Playbook succeeded" in streamed.err
+    assert "Playbook succeeded" not in streamed.err
     assert "ok: [remote_vm]" not in streamed.err
 
     monkeypatch.setattr(

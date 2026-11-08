@@ -388,6 +388,13 @@ GALAXY_ROLES_DIRNAME = "galaxy_roles"
 ROLES_DIRNAME = "roles"
 
 
+def ssh_option_log_level() -> str:
+    """OpenSSH log level. ERROR hides the known-hosts notice; ``-v`` shows it."""
+    if log.verbosity() >= 1:
+        return "INFO"
+    return "ERROR"
+
+
 def roles_search_path(rig_dir: str) -> str:
     """Ansible role search path: committed roles, then Galaxy installs."""
     return os.pathsep.join(
@@ -1256,6 +1263,14 @@ class RemoteDevManager:
             log.warning("Could not ensure state bucket: %s", e)
             return False
 
+    def state_object_path(self, name: Optional[str] = None) -> str:
+        """Bucket path of the state index, or of one environment record."""
+        if name:
+            key = f"{self.state_prefix}/environments/{name}.yml"
+        else:
+            key = f"{self.state_prefix}/state.yml"
+        return f"{self.state_bucket}/{key}"
+
     def _save_state(self, environment: Dict) -> bool:
         """Save environment state to shared bucket - only basic facts"""
         if not self.storage_manager:
@@ -1320,7 +1335,11 @@ class RemoteDevManager:
                 f"{self.state_prefix}/environments/{env_name}.yml"
             )
 
-            log.info("State synced")
+            log.debug(
+                "State synced to %s and %s",
+                self.state_object_path(),
+                self.state_object_path(env_name),
+            )
             return True
         except Exception as e:
             log.warning("Could not save state: %s", e)
@@ -1752,7 +1771,7 @@ class RemoteDevEnvironment:
         if skip:
             skipped = [p for p in wanted if p in skip]
             if skipped:
-                log.info(
+                log.debug(
                     "Skipping playbook(s) covered by %s snapshot%s: %s",
                     self.boot_source,
                     f" ({self.boot_snapshot_description})"
@@ -1789,7 +1808,7 @@ class RemoteDevEnvironment:
             return False
 
         installed_agents, _default_agent = configured_agents(project)
-        log.info(
+        log.debug(
             "Applying %s on %s as root@%s (agents=%s)",
             "+".join(wanted),
             project_dir,
@@ -1865,7 +1884,7 @@ class RemoteDevEnvironment:
             if not path or not os.path.exists(path):
                 log.error("%s playbook not found: %s", kind.capitalize(), path)
                 return False
-            log.info("Running %s playbook", kind)
+            log.info("Running %s playbook %s", kind, path)
             if not ansible._run_one_playbook(path, stream=stream):
                 if kind == "materialize" and soft_fail_materialize:
                     log.warning(
@@ -1882,9 +1901,7 @@ class RemoteDevEnvironment:
                     log.warning("Continuing without a successful %s snapshot", kind)
 
         if materialize_failed:
-            log.info("Playbooks finished (materialize had errors)")
-        else:
-            log.info("Playbooks complete")
+            log.warning("Playbooks finished (materialize had errors)")
         return True
 
     def _snapshot_after_playbook(
@@ -2145,12 +2162,10 @@ class RemoteDevEnvironment:
             if not path or not os.path.exists(path):
                 log.debug("Skipping %s playbook (not found)", kind)
                 continue
-            log.info("Running %s playbook before deleting VM", kind)
+            log.info("Running %s playbook %s", kind, path)
             if not ansible._run_one_playbook(path, stream=stream):
                 log.warning("%s playbook failed; continuing with VM deletion", kind.capitalize())
                 ok = False
-        if ok:
-            log.info("Destroy playbooks finished")
         return ok
 
     def cleanup(self, project_dir: Optional[str] = None):
@@ -2209,7 +2224,7 @@ class RemoteDevEnvironment:
                     self.manager.state_bucket,
                     f"{self.manager.state_prefix}/environments/{self.name}.yml"
                 )
-                log.info("State synced")
+                log.debug("State synced to %s", self.manager.state_object_path())
             else:
                 log.warning("Could not update state bucket")
         else:
@@ -2222,8 +2237,6 @@ class RemoteDevEnvironment:
             self.remove_ssh_config_host()
         except OSError:
             pass
-
-        log.info("Destroyed '%s'", self.name)
 
     def get_connection_info(self) -> Dict:
         """Get information needed to connect to the VM"""
@@ -2433,7 +2446,7 @@ echo "Agent installation complete!"
                     '/tmp/state.yml',
                     f"{self.manager.state_prefix}/state.yml"
                 )
-                log.info("State synced")
+                log.debug("State synced to %s", self.manager.state_object_path())
 
             return True
 
@@ -2514,22 +2527,9 @@ echo "Agent installation complete!"
 
         ssh_key_path = f"/tmp/{self.ssh_key_name}"
         remote_cmd = self.agent_remote_command(agent_type, extra_args=agent_args)
-        ssh_cmd = [
-            "ssh",
-            "-tt",
-            "-i",
-            ssh_key_path,
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "IdentitiesOnly=yes",
-            f"root@{self.vm_ip}",
-            remote_cmd,
-        ]
+        ssh_cmd = self._interactive_ssh_command(remote_cmd)
 
-        log.info("Attaching to %s on %s", agent_type, self.vm_ip)
+        log.info("Attaching to %s on %s", agent_type, self.name)
         log.debug("SSH key=%s", ssh_key_path)
         log.debug("Remote command=%s", remote_cmd)
 
@@ -2567,6 +2567,58 @@ echo "Agent installation complete!"
             log.info("Remembered agent session %s for '%s'", session_id, self.name)
             log.debug("Resume later with: rig attach  (or --resume/--session %s)", session_id)
         return int(exit_code)
+
+    def _interactive_ssh_command(self, remote_cmd: str) -> List[str]:
+        """SSH argv for an interactive session as root."""
+        ssh_key_path = f"/tmp/{self.ssh_key_name}"
+        return [
+            "ssh",
+            "-tt",
+            "-i",
+            ssh_key_path,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            f"LogLevel={ssh_option_log_level()}",
+            f"root@{self.vm_ip}",
+            remote_cmd,
+        ]
+
+    def open_ssh(self, remote_command: Optional[str] = None) -> int:
+        """Open an SSH shell on the VM, or run one remote command."""
+        if not self.vm_ip or not self.ssh_key_name:
+            log.error("VM not ready for SSH")
+            return 1
+
+        if remote_command:
+            remote_cmd = remote_command
+        else:
+            remote_cmd = (
+                f"mkdir -p {REMOTE_WORKSPACE_ROOT} && "
+                f"cd {REMOTE_WORKSPACE_ROOT} && exec bash -l"
+            )
+        ssh_cmd = self._interactive_ssh_command(remote_cmd)
+        log.info("Connecting to %s", self.name)
+        log.debug("SSH key=%s", f"/tmp/{self.ssh_key_name}")
+        log.debug("Remote command=%s", remote_cmd)
+
+        session_log = os.path.join("/tmp/.rig", f"ssh-{self.name}.log")
+        try:
+            os.makedirs("/tmp/.rig", mode=0o700, exist_ok=True)
+        except OSError:
+            pass
+        try:
+            return self._run_attach_ssh(ssh_cmd, session_log)
+        except FileNotFoundError:
+            log.error("ssh client not found on PATH")
+            return 1
+        except KeyboardInterrupt:
+            log.info("Disconnected from %s", self.name)
+            return 130
 
     @staticmethod
     def _run_attach_ssh(ssh_cmd: List[str], attach_log: str) -> int:
@@ -5262,7 +5314,11 @@ class AnsibleManager:
             'ansible-playbook', playbook_path,
             '-i', self.inventory_path,
             '--ssh-common-args',
-            '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes'
+            (
+                "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+                "-o IdentitiesOnly=yes "
+                f"-o LogLevel={ssh_option_log_level()}"
+            )
         ]
 
         if self.project_config is None:
@@ -5391,13 +5447,13 @@ class AnsibleManager:
                     _failure_detail(output),
                 )
                 return False
-            log.info("Playbook succeeded: %s", playbook_path)
+            log.debug("Playbook succeeded: %s", playbook_path)
             return True
 
         result = subprocess.run(cmd, env=self.ansible_env, capture_output=True, text=True, timeout=600)
         combined = f"{result.stdout or ''}\n{result.stderr or ''}"
         if result.returncode == 0 and not _output_indicates_no_hosts(combined):
-            log.info("Playbook succeeded: %s", playbook_path)
+            log.debug("Playbook succeeded: %s", playbook_path)
             if log.verbosity() >= 1 and result.stdout:
                 log.debug("STDOUT:\n%s", self._redact_secrets(result.stdout))
             return True

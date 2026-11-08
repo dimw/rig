@@ -404,7 +404,7 @@ class TestRemoteDevManagerCoverage:
         )
         assert mgr.get_vm_ip("1") == "203.0.113.1"
 
-    def test_state_bucket_save_load_list(self, tmp_path, monkeypatch):
+    def test_state_bucket_save_load_list(self, tmp_path, monkeypatch, capsys):
         uploads = []
 
         class Storage:
@@ -428,7 +428,20 @@ class TestRemoteDevManagerCoverage:
         assert mgr._ensure_state_bucket() is True
 
         mgr.list_dev_environments = lambda prefix="dev-": []
+        from cli import log as rig_log
+
+        rig_log.configure_logging()
+        capsys.readouterr()
         assert mgr._save_state({"name": "dev-new", "id": 2, "ip": "1.1.1.1"}) is True
+        assert "State synced" not in capsys.readouterr().err
+        rig_log.configure_logging(verbose=True)
+        capsys.readouterr()
+        assert mgr._save_state({"name": "dev-new", "id": 2, "ip": "1.1.1.1"}) is True
+        debug = capsys.readouterr().err
+        index = f"{mgr.state_bucket}/{mgr.state_prefix}/state.yml"
+        record = f"{mgr.state_bucket}/{mgr.state_prefix}/environments/dev-new.yml"
+        assert f"State synced to {index} and {record}" in debug
+        rig_log.configure_logging()
         assert uploads
 
         mgr.list_dev_environments = RemoteDevManager.list_dev_environments.__get__(mgr)

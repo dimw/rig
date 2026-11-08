@@ -32,6 +32,97 @@ def test_merge_agent_args_continue_session_resume_and_remainder():
     ) == ["--continue", "--model", "anthropic/claude"]
 
 
+def test_ssh_uses_last_env_and_forwards_a_command():
+    with patch("cli.main._load_credentials"), patch.dict(
+        os.environ, {"HETZNER_CLOUD_API_TOKEN": "tok"}, clear=False
+    ), patch("cli.main.StorageManager", side_effect=ValueError("no storage")), patch(
+        "cli.main.resolve_env_name", return_value="dev-ssh"
+    ), patch("cli.main.RemoteDevEnvironment") as env_cls, patch(
+        "cli.main.remember_last_env"
+    ) as remember, patch("cli.main.os.path.exists", return_value=True):
+        instance = MagicMock()
+        instance.name = "dev-ssh"
+        instance.vm_ip = "203.0.113.9"
+        instance.ssh_key_name = "dev-ssh-key"
+        instance.resolve_resources.return_value = True
+        instance.open_ssh.return_value = 0
+        env_cls.return_value = instance
+
+        assert main(["ssh", "--", "uptime", "-p"]) == 0
+        instance.ensure_firewall_access.assert_called_once()
+        remember.assert_called_once_with("dev-ssh")
+        assert instance.open_ssh.call_args.kwargs["remote_command"] == "uptime -p"
+
+
+def test_ssh_uses_named_env_and_a_command():
+    with patch("cli.main._load_credentials"), patch.dict(
+        os.environ, {"HETZNER_CLOUD_API_TOKEN": "tok"}, clear=False
+    ), patch("cli.main.StorageManager", side_effect=ValueError("no storage")), patch(
+        "cli.main.RemoteDevEnvironment"
+    ) as env_cls, patch("cli.main.remember_last_env"), patch(
+        "cli.main.os.path.exists", return_value=True
+    ):
+        instance = MagicMock()
+        instance.name = "dev-named"
+        instance.vm_ip = "203.0.113.8"
+        instance.ssh_key_name = "dev-named-key"
+        instance.resolve_resources.return_value = True
+        instance.open_ssh.return_value = 0
+        env_cls.return_value = instance
+
+        assert main(["ssh", "dev-named", "--", "echo", "hi"]) == 0
+        assert env_cls.call_args.kwargs["name"] == "dev-named"
+        assert instance.open_ssh.call_args.kwargs["remote_command"] == "echo hi"
+
+
+def test_ssh_fails_without_token(capsys):
+    with patch("cli.main._load_credentials"), patch.dict(
+        os.environ, {"HETZNER_CLOUD_API_TOKEN": "", "HZ_TOKEN": ""}, clear=False
+    ):
+        assert main(["ssh"]) == 1
+    assert "credentials" in capsys.readouterr().err.lower()
+
+
+def test_ssh_fails_when_vm_or_key_missing(capsys):
+    with patch("cli.main._load_credentials"), patch.dict(
+        os.environ, {"HETZNER_CLOUD_API_TOKEN": "tok"}, clear=False
+    ), patch("cli.main.StorageManager", side_effect=ValueError("no storage")), patch(
+        "cli.main.RemoteDevEnvironment"
+    ) as env_cls, patch("cli.main.resolve_env_name", return_value="dev-ssh"):
+        missing = MagicMock()
+        missing.resolve_resources.return_value = False
+        missing.vm_ip = None
+        env_cls.return_value = missing
+        assert main(["ssh"]) == 1
+
+        missing.resolve_resources.return_value = True
+        missing.vm_ip = "1.2.3.4"
+        missing.ssh_key_name = "missing-key"
+        with patch("cli.main.os.path.exists", return_value=False):
+            assert main(["ssh"]) == 1
+    err = capsys.readouterr().err
+    assert "no VM IP found" in err
+    assert "SSH private key not found" in err
+
+
+def test_ssh_reports_connection_errors(capsys):
+    with patch("cli.main._load_credentials"), patch.dict(
+        os.environ, {"HETZNER_CLOUD_API_TOKEN": "tok"}, clear=False
+    ), patch("cli.main.StorageManager", side_effect=ValueError("no storage")), patch(
+        "cli.main.RemoteDevEnvironment", side_effect=RuntimeError("boom")
+    ), patch("cli.main.resolve_env_name", return_value="dev-ssh"):
+        assert main(["ssh"]) == 1
+    assert "Error connecting to environment: boom" in capsys.readouterr().err
+
+
+def test_ssh_requires_name_when_no_last_env(capsys):
+    with patch("cli.main._load_credentials"), patch.dict(
+        os.environ, {"HETZNER_CLOUD_API_TOKEN": "tok"}, clear=False
+    ), patch("cli.main.resolve_env_name", return_value=None):
+        assert main(["ssh"]) == 1
+    assert "Environment name is required" in capsys.readouterr().err
+
+
 def test_attach_requires_name_when_no_last_env(capsys):
     with patch("cli.main._load_credentials"), patch.dict(
         os.environ, {"HETZNER_CLOUD_API_TOKEN": "tok"}, clear=False
