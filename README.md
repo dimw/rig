@@ -27,9 +27,9 @@ Run `rig` from your machine, CI/CD, or a control plane: it provisions cloud VMs 
 
 ## Coding agents
 
-Chosen at `rig init` (`agent.types` in `rig.yml`, same multi-select as git projects: numbers, names, or `all`). Every selected agent is installed and configured on the VM. When more than one is selected, init asks which is the default for `rig attach` (`agent.type`). Pass `--agent` to open another one.
+Chosen at `rig init` (`agent.enabled` in `rig.yml`, same multi-select as git projects: numbers, names, or `all`). Every selected agent is installed and configured on the VM. When more than one is selected, init asks which is the default for `rig attach` (`agent.default`). Pass `--agent` to open another one.
 
-| Agent | `agent.type` | API key |
+| Agent | `agent.default` | API key |
 | --- | --- | --- |
 | [OpenCode](https://opencode.ai) | `opencode` (default) | Optional. One agent: `coding_agent_api_key`. Several agents: `opencode_api_key`. Enter skips and uses free Zen models |
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `claude` | One agent: `coding_agent_api_key` (Anthropic). Several agents: `claude_api_key` |
@@ -46,7 +46,7 @@ Each selected agent is asked for its own key. Scaffolds land under `.rig/.openco
 | Remote-SSH (default) | VS Code (`code`), VS Code Insiders (`code-insiders`), Cursor (`cursor`), VSCodium (`codium`) |
 | Browser (`--browser`) | code-server (password: vaulted `vscode_browser_password`) |
 
-Chosen at `rig init` (`editor` in `rig.yml`), or override with `--editor`. Local Cursor/VS Code talks to the VM over SSH (no Cursor install on the VM). Browser login: `rig vars decrypt vscode_browser_password`.
+Chosen at `rig init` (`editor.enabled` in `rig.yml`, same multi-select as git projects: numbers, names, or `all`). When more than one is selected, init asks which is the default for `rig dev` (`editor.default`). Pass `--editor` to open another enabled one. These are local clients: nothing extra is installed on the VM, and each IDE downloads its own remote server the first time it connects. Browser login: `rig vars decrypt vscode_browser_password`.
 
 ## Layout
 
@@ -83,9 +83,11 @@ firewall:
   allowed_ips: []     # static allow-list; also merged into dynamic modes
   ports: []           # extra inbound ports, e.g. [8080, "3000-3001", {port: 53, protocol: udp}]
 agent:
-  type: opencode          # default for `rig attach`; or claude | cursor
-  # types: [opencode, claude, cursor]  # install every listed agent
-editor: code                  # code | code-insiders | cursor | codium
+  default: opencode       # default for `rig attach`; or claude | cursor
+  enabled: [opencode]     # agents installed on the VM
+editor:
+  default: code           # default for `rig dev`
+  enabled: [code]         # local IDEs `rig dev --editor` may open
 playbooks:
   provision: .rig/provision.yml
   configure: .rig/configure.yml
@@ -181,7 +183,7 @@ Global: `-v` debug · `-q` warnings/errors only · `--version`
 | `create` | `[--name]` `[--type]` `[--availability-zone]` `[--image]` `[--no-attach]` `[--force-playbooks\|--force-system\|--force-workspace]` | VM defaults from `rig.yml`; flags override. `--region` aliases `--availability-zone`. |
 | `apply` | `[name]` `[--provision\|--configure\|--authorize\|--materialize]` | Default: authorize then materialize |
 | `attach` | `[name]` `[-c\|--continue]` `[-s\|--session ID]` `[--resume [ID]]` `[--agent opencode\|claude\|cursor]` `[-- …agent args]` | Reopens last remembered session by default; `--agent` picks which installed agent |
-| `dev` | `[name]` `[--path /workspace]` `[--browser]` `[--editor code\|cursor\|…]` | Remote-SSH by default; `--editor` overrides `editor` in `rig.yml` |
+| `dev` | `[name]` `[--path /workspace]` `[--browser]` `[--editor code\|cursor\|…]` | Remote-SSH by default; `--editor` opens another IDE from `editor.enabled`. Defaults to `editor.default` |
 | `list` | | Lists envs, or `No remote environments` |
 | `destroy` | `[name …]` | Runs finalize then destroy playbooks first; multi-name OK |
 | `cache` | `list\|clear` `[--system\|--workspace] [--all] [-y]` | List or clear; unused by default, `--all` includes current |

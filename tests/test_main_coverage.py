@@ -357,7 +357,7 @@ def test_dev_uses_project_editor_when_omitted(tok_env, tmp_path):
     ), patch("cli.main.resolve_env_name", return_value="dev"), patch(
         "cli.main.RemoteDevEnvironment"
     ) as env_cls, patch("cli.main.remember_last_env"), patch(
-        "cli.remote_dev.project_editor_preference", return_value="codium"
+        "cli.remote_dev.configured_editors", return_value=(["codium"], "codium")
     ) as pref:
         inst = MagicMock()
         inst.resolve_resources.return_value = True

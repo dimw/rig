@@ -12,7 +12,7 @@ import shlex
 import subprocess
 import socket
 import webbrowser
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Sequence, Tuple
 import requests
 
 from cli import log as log
@@ -39,8 +39,9 @@ except ImportError:
 # Project files live here on the VM — separate from /root home (dotfiles, caches).
 REMOTE_WORKSPACE_ROOT = "/workspace"
 
-# Local editor CLIs for ``rig dev`` (Remote-SSH). Prefer ``editor`` in rig.yml
-# or ``--editor``; otherwise the first available binary wins.
+# Local editor CLIs for ``rig dev`` (Remote-SSH). ``editor.enabled`` is the
+# chosen set; ``editor.default`` is the one ``rig dev`` opens. ``--editor``
+# picks another enabled one.
 SUPPORTED_EDITORS = ("code", "code-insiders", "cursor", "codium")
 EDITOR_LABELS = {
     "code": "VS Code",
@@ -77,7 +78,7 @@ def prompt_editor(
     default: str = DEFAULT_EDITOR,
     input_fn=None,
 ) -> str:
-    """Ask which local editor CLI to prefer for ``rig dev``."""
+    """Ask which local editor CLI to prefer for ``rig dev`` (single choice)."""
     ask = input_fn or input
     try:
         default = normalize_editor_type(default)
@@ -90,19 +91,284 @@ def prompt_editor(
     return normalize_editor_type(answer)
 
 
+def coerce_editor_types(value: Any) -> List[str]:
+    """
+    Normalize a string, comma-separated string, or list into editor ids.
+
+    Order is preserved and duplicates are dropped. Empty input returns [].
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        parts = [part.strip() for part in text.replace(" ", ",").split(",") if part.strip()]
+    elif isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                parts.append(text)
+    else:
+        text = str(value).strip()
+        parts = [text] if text else []
+
+    selected: List[str] = []
+    seen = set()
+    for part in parts:
+        editor = normalize_editor_type(part)
+        if editor not in seen:
+            selected.append(editor)
+            seen.add(editor)
+    return selected
+
+
+def _editor_block(config: Dict[str, Any]) -> Dict[str, Any]:
+    raw = config.get("editor")
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def editor_default_field(config: Optional[Dict[str, Any]] = None) -> Any:
+    """``editor.default``, or a legacy ``default_editor`` / ``editor`` string."""
+    config = config or {}
+    raw = _editor_block(config).get("default")
+    if raw not in (None, ""):
+        return raw
+    raw = config.get("default_editor")
+    if raw not in (None, ""):
+        return raw
+    legacy = config.get("editor")
+    if isinstance(legacy, str) and legacy.strip():
+        return legacy
+    return None
+
+
+def editor_enabled_field(config: Optional[Dict[str, Any]] = None) -> Any:
+    """``editor.enabled``, or the legacy top-level ``editors`` list."""
+    config = config or {}
+    enabled = _editor_block(config).get("enabled")
+    if enabled:
+        return enabled
+    return config.get("editors")
+
+
+def resolve_configured_editors(
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[str], Optional[str]]:
+    """
+    Return ``(enabled_editors, default_editor)``.
+
+    ``editor.enabled`` is the chosen set. ``editor.default`` is the ``rig dev``
+    default when it is a member of that set. Legacy ``editors``,
+    ``default_editor``, and a string ``editor`` are still accepted. An empty
+    config returns ``([], None)`` so ``rig dev`` can auto-detect a local binary.
+    """
+    config = config or {}
+    editors: List[str] = []
+    raw_list = editor_enabled_field(config)
+    if raw_list:
+        try:
+            editors = coerce_editor_types(raw_list)
+        except ValueError:
+            editors = []
+    if not editors:
+        raw_editor = editor_default_field(config)
+        if raw_editor:
+            try:
+                editors = coerce_editor_types(raw_editor)
+            except ValueError:
+                editors = []
+    if not editors:
+        return [], None
+
+    primary: Optional[str] = None
+    raw_primary = editor_default_field(config)
+    if isinstance(raw_primary, str) and raw_primary.strip():
+        try:
+            primary = normalize_editor_type(raw_primary)
+        except ValueError:
+            primary = None
+    if primary not in editors:
+        primary = editors[0]
+    return editors, primary
+
+
+def apply_editor_selection(
+    config: Dict[str, Any],
+    editors: Any,
+    default: Any = None,
+) -> List[str]:
+    """
+    Write ``editor.default`` and ``editor.enabled`` onto a workspace config dict.
+
+    ``editor.default`` is the ``rig dev`` default. The requested name is used
+    when that editor was selected, otherwise the first selected editor.
+    """
+    try:
+        selected = coerce_editor_types(editors) or [DEFAULT_EDITOR]
+    except ValueError:
+        selected = [DEFAULT_EDITOR]
+    primary: Optional[str] = None
+    if isinstance(default, str) and default.strip():
+        try:
+            primary = normalize_editor_type(default)
+        except ValueError:
+            primary = None
+    if primary not in selected:
+        primary = selected[0]
+    block = config.get("editor")
+    if not isinstance(block, dict):
+        block = {}
+    block["default"] = primary
+    block["enabled"] = list(selected)
+    config["editor"] = block
+    config.pop("default_editor", None)
+    config.pop("editors", None)
+    return selected
+
+
+def parse_editor_selection(
+    answer: str,
+    *,
+    default: Sequence[str],
+) -> List[str]:
+    """Parse 'all', indexes, or names the same way git project selection works."""
+    try:
+        defaults = coerce_editor_types(list(default)) or [DEFAULT_EDITOR]
+    except ValueError:
+        defaults = [DEFAULT_EDITOR]
+    raw = (answer or "").strip()
+    if not raw:
+        return defaults
+    if raw.lower() in ("all", "*"):
+        return list(SUPPORTED_EDITORS)
+
+    selected: List[str] = []
+    seen = set()
+    tokens = [token.strip() for token in raw.replace(" ", ",").split(",") if token.strip()]
+    if not tokens:
+        return defaults
+    for token in tokens:
+        if token.isdigit():
+            index = int(token) - 1
+            if not 0 <= index < len(SUPPORTED_EDITORS):
+                raise ValueError(
+                    f"Editor number {token} is out of range. "
+                    f"Choose 1-{len(SUPPORTED_EDITORS)}, names, or all."
+                )
+            editor = SUPPORTED_EDITORS[index]
+        else:
+            editor = normalize_editor_type(token)
+        if editor not in seen:
+            selected.append(editor)
+            seen.add(editor)
+    return selected
+
+
+def prompt_editors(
+    default: Any = DEFAULT_EDITOR,
+    input_fn=None,
+) -> List[str]:
+    """
+    Ask which local editors to enable for ``rig dev``.
+
+    Accepts numbers, names, or ``all``, like the git project picker.
+    Enter keeps ``default``.
+    """
+    ask = input_fn or input
+    try:
+        defaults = coerce_editor_types(default) or [DEFAULT_EDITOR]
+    except ValueError:
+        defaults = [DEFAULT_EDITOR]
+    print("Editors:")
+    for index, editor in enumerate(SUPPORTED_EDITORS, start=1):
+        print(f"  {index}. {editor} ({EDITOR_LABELS[editor]})")
+    default_label = ",".join(defaults)
+    answer = ask(
+        "Editors to include (numbers, names, or all) "
+        f"[{default_label}]: "
+    )
+    return parse_editor_selection(answer, default=defaults)
+
+
+def prompt_default_editor(
+    selected: Sequence[str],
+    default: Any = None,
+    input_fn=None,
+) -> str:
+    """
+    Ask which selected editor ``rig dev`` should open.
+
+    A single selected editor is returned without a prompt. Numbers match the
+    catalog shown by ``prompt_editors`` (not a renumbered sub-list).
+    """
+    try:
+        editors = coerce_editor_types(list(selected)) or [DEFAULT_EDITOR]
+    except ValueError:
+        editors = [DEFAULT_EDITOR]
+    if len(editors) == 1:
+        return editors[0]
+    preferred = editors[0]
+    if isinstance(default, str) and default.strip():
+        try:
+            candidate = normalize_editor_type(default)
+        except ValueError:
+            candidate = None
+        if candidate in editors:
+            preferred = candidate
+    by_number = {
+        str(index): editor
+        for index, editor in enumerate(SUPPORTED_EDITORS, start=1)
+        if editor in editors
+    }
+    print("Default editor for rig dev:")
+    for number, editor in by_number.items():
+        print(f"  {number}. {editor} ({EDITOR_LABELS[editor]})")
+    ask = input_fn or input
+    answer = ask(f"Default editor [{preferred}]: ").strip()
+    if not answer:
+        return preferred
+    if answer.isdigit():
+        numbered = by_number.get(answer)
+        if not numbered:
+            raise ValueError(
+                f"Default editor number {answer} is not one of the selected editors "
+                f"({', '.join(editors)})"
+            )
+        return numbered
+    chosen = normalize_editor_type(answer)
+    if chosen not in editors:
+        raise ValueError(
+            f"Default editor {chosen!r} was not selected. "
+            f"Choose one of: {', '.join(editors)}"
+        )
+    return chosen
+
+
+def configured_editors(project) -> Tuple[List[str], Optional[str]]:
+    """Enabled local editors and the default ``rig dev`` target."""
+    if project is None or not getattr(project, "config", None):
+        return [], None
+    return resolve_configured_editors(project.config)
+
+
 def project_editor_preference(project_dir: Optional[str] = None) -> Optional[str]:
-    """Return ``editor`` from ``rig.yml`` when set, else None (auto-detect)."""
+    """Return the default editor from ``rig.yml``, else None (auto-detect)."""
     project = ProjectConfig(os.path.abspath(project_dir or os.getcwd()))
     if not project.load() or not project.config:
         return None
-    raw = project.config.get("editor")
-    if raw is None or raw == "":
-        return None
-    try:
-        return normalize_editor_type(str(raw))
-    except ValueError:
+    _editors, default = resolve_configured_editors(project.config)
+    if default:
+        return default
+    raw = editor_default_field(project.config)
+    if raw not in (None, ""):
         log.warning("Ignoring invalid editor %r in rig.yml", raw)
-        return None
+    return None
 
 # Paths written under the project by Galaxy / create that should not be committed.
 GITIGNORE_MARKER_BEGIN = "# >>> rig managed"
@@ -2282,12 +2548,23 @@ echo "Agent installation complete!"
                 handle.write(updated)
 
     @staticmethod
-    def resolve_editor_command(prefer: Optional[str] = None) -> Optional[str]:
-        """Pick a local editor CLI: code, cursor, codium, …"""
-        candidates = []
+    def resolve_editor_command(
+        prefer: Optional[str] = None,
+        fallbacks: Optional[Sequence[str]] = None,
+    ) -> Optional[str]:
+        """
+        Pick a local editor CLI.
+
+        ``fallbacks`` defaults to every supported editor. Pass ``[]`` to require
+        ``prefer`` and skip other binaries.
+        """
+        candidates: List[str] = []
         if prefer:
             candidates.append(prefer)
-        candidates.extend(["code", "code-insiders", "cursor", "codium"])
+        extra = list(SUPPORTED_EDITORS) if fallbacks is None else list(fallbacks)
+        for name in extra:
+            if name not in candidates:
+                candidates.append(name)
         seen = set()
         for name in candidates:
             if name in seen:
@@ -2320,6 +2597,7 @@ echo "Agent installation complete!"
         project_dir: Optional[str] = None,
         browser: bool = False,
         editor: Optional[str] = None,
+        editor_fallbacks: Optional[Sequence[str]] = None,
         ssh_config_path: Optional[str] = None,
     ) -> int:
         """
@@ -2384,13 +2662,22 @@ echo "Agent installation complete!"
                 log.info("Open this URL manually: %s", url)
                 return 1
 
-        editor_bin = self.resolve_editor_command(prefer=editor)
+        editor_bin = self.resolve_editor_command(
+            prefer=editor, fallbacks=editor_fallbacks
+        )
         if not editor_bin:
             url = self.code_server_url(
                 project_dir=project_dir, folder=remote_path
             )
-            log.error("No local VS Code/Cursor CLI found (tried: code, cursor, codium)")
-            log.error("Install the 'code' shell command, or run: rig dev --browser")
+            if editor and editor_fallbacks == []:
+                log.error("Editor '%s' not found", editor)
+            else:
+                tried = editor_fallbacks if editor_fallbacks is not None else SUPPORTED_EDITORS
+                log.error(
+                    "No local editor CLI found (tried: %s)",
+                    ", ".join(tried) or editor or "code",
+                )
+            log.error("Install the editor shell command, or run: rig dev --browser")
             log.debug("code-server URL: %s", url)
             return 1
 
@@ -3161,12 +3448,16 @@ class ProjectConfig:
                 "ports": [],
             },
             "agent": {
-                "type": "opencode",
+                "default": "opencode",
+                "enabled": ["opencode"],
                 "vscode": True,
                 "credentials_var": "coding_agent_api_key",
             },
-            # Preferred local CLI for ``rig dev`` (Remote-SSH).
-            "editor": DEFAULT_EDITOR,
+            # Local IDEs for ``rig dev`` (Remote-SSH). Not installed on the VM.
+            "editor": {
+                "default": DEFAULT_EDITOR,
+                "enabled": [DEFAULT_EDITOR],
+            },
             "playbooks": {
                 "provision": f"{self.RIG_DIR}/{self.PROVISION_YAML}",
                 "configure": f"{self.RIG_DIR}/{self.CONFIGURE_YAML}",
@@ -3405,8 +3696,44 @@ class ProjectConfig:
         agent_cfg = self.config.setdefault("agent", {})
         return apply_agent_selection(agent_cfg, agent_types, default=default)
 
+    def _migrate_default_names(self) -> None:
+        """Fold legacy agent/editor keys into ``default`` and ``enabled``."""
+        if not isinstance(self.config, dict):
+            return
+        agent = self.config.get("agent")
+        if isinstance(agent, dict):
+            legacy = agent.get("type")
+            if agent.get("default") not in (None, ""):
+                if isinstance(legacy, str):
+                    agent.pop("type", None)
+            elif isinstance(legacy, str) and legacy.strip():
+                agent["default"] = agent.pop("type")
+            if not agent.get("enabled") and agent.get("types"):
+                agent["enabled"] = agent.pop("types")
+            elif agent.get("enabled"):
+                agent.pop("types", None)
+
+        raw_editor = self.config.get("editor")
+        block = dict(raw_editor) if isinstance(raw_editor, dict) else {}
+        legacy_name = raw_editor if isinstance(raw_editor, str) else None
+        top_default = self.config.get("default_editor")
+        top_enabled = self.config.get("editors")
+        if block.get("default") in (None, ""):
+            if top_default not in (None, ""):
+                block["default"] = top_default
+            elif isinstance(legacy_name, str) and legacy_name.strip():
+                block["default"] = legacy_name
+        if not block.get("enabled") and top_enabled:
+            block["enabled"] = list(top_enabled)
+        if block:
+            self.config["editor"] = block
+        self.config.pop("default_editor", None)
+        self.config.pop("editors", None)
+
     def _selected_default_agent(self, selected: List[str]) -> str:
-        primary = (self.config.get("agent") or {}).get("type")
+        from cli.agents import agent_default_field
+
+        primary = agent_default_field(self.config.get("agent") or {})
         if isinstance(primary, str) and primary in selected:
             return primary
         return selected[0]
@@ -3429,6 +3756,7 @@ class ProjectConfig:
                 self.config = defaults
                 created.append(self.RIG_YAML)
             else:
+                self._migrate_default_names()
                 before = yaml.dump(self.config, sort_keys=True)
                 if name and not self.config.get("name"):
                     self.config["name"] = name
@@ -3472,6 +3800,12 @@ class ProjectConfig:
                 )
                 selected_agents = self._set_agent_selection(
                     selected_agents, default=primary
+                )
+
+            enabled_editors, chosen_editor = resolve_configured_editors(self.config)
+            if enabled_editors:
+                apply_editor_selection(
+                    self.config, enabled_editors, default=chosen_editor
                 )
 
             if not self.requirements:
@@ -3902,6 +4236,7 @@ class Workspace:
         agent_type: Optional[str] = None,
         agent_types: Optional[List[str]] = None,
         editor: Optional[str] = None,
+        editors: Optional[List[str]] = None,
     ) -> bool:
         """Idempotently initialize workspace config and register selected repos."""
         workspace_name = name or os.path.basename(self.path.rstrip(os.sep)) or "workspace"
@@ -3923,10 +4258,19 @@ class Workspace:
                 candidate = None
             if candidate in chosen_agents:
                 chosen_agent = candidate
+        raw_editors: Any = editors if editors is not None else (editor or DEFAULT_EDITOR)
         try:
-            chosen_editor = normalize_editor_type(editor or DEFAULT_EDITOR)
+            chosen_editors = coerce_editor_types(raw_editors) or [DEFAULT_EDITOR]
         except ValueError:
-            chosen_editor = DEFAULT_EDITOR
+            chosen_editors = [DEFAULT_EDITOR]
+        chosen_editor = chosen_editors[0]
+        if isinstance(editor, str) and editor.strip():
+            try:
+                editor_candidate = normalize_editor_type(editor)
+            except ValueError:
+                editor_candidate = None
+            if editor_candidate in chosen_editors:
+                chosen_editor = editor_candidate
 
         project = ProjectConfig(self.path)
         # Pass agents into init so scaffold/config persist before add_repo reloads.
@@ -3941,7 +4285,7 @@ class Workspace:
         project.config["kind"] = "workspace"
         project.config["name"] = workspace_name
         project._set_agent_selection(chosen_agents, default=chosen_agent)
-        project.config["editor"] = chosen_editor
+        apply_editor_selection(project.config, chosen_editors, default=chosen_editor)
         project.set_vars("coding_agent_type", chosen_agent)
         project.set_vars("coding_agent_types", list(chosen_agents))
 
@@ -4021,7 +4365,7 @@ class Workspace:
         project.config["git_providers"] = providers
         # Re-apply after add_repo/load cycles so agent/editor choice is not lost.
         project._set_agent_selection(chosen_agents, default=chosen_agent)
-        project.config["editor"] = chosen_editor
+        apply_editor_selection(project.config, chosen_editors, default=chosen_editor)
         project.set_vars("coding_agent_type", chosen_agent)
         project.set_vars("coding_agent_types", list(chosen_agents))
 
@@ -4046,7 +4390,14 @@ class Workspace:
                 + ", ".join(chosen_agents)
                 + f" (attach default: {chosen_agent})"
             )
-        print(f"Editor: {chosen_editor}")
+        if len(chosen_editors) == 1:
+            print(f"Editor: {chosen_editor}")
+        else:
+            print(
+                "Editors: "
+                + ", ".join(chosen_editors)
+                + f" (dev default: {chosen_editor})"
+            )
         return True
 
 
@@ -4194,9 +4545,27 @@ def interactive_env_init(
         print(f"Error: {exc}")
         return False
 
-    existing_editor = existing.get("editor") or DEFAULT_EDITOR
+    existing_editors, existing_editor = resolve_configured_editors(existing)
+    if not existing_editors:
+        existing_editors = [DEFAULT_EDITOR]
+        existing_editor = DEFAULT_EDITOR
     try:
-        editor = prompt_editor(default=str(existing_editor), input_fn=input_fn)
+        editors = prompt_editors(default=existing_editors, input_fn=input_fn)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return False
+    if isinstance(editors, str):
+        try:
+            editors = coerce_editor_types(editors) or [DEFAULT_EDITOR]
+        except ValueError:
+            editors = [DEFAULT_EDITOR]
+    try:
+        preferred_editor = (
+            existing_editor if existing_editor in editors else editors[0]
+        )
+        editor = prompt_default_editor(
+            editors, default=preferred_editor, input_fn=input_fn
+        )
     except ValueError as exc:
         print(f"Error: {exc}")
         return False
@@ -4220,6 +4589,7 @@ def interactive_env_init(
         agent_type=agent_type,
         agent_types=agent_types,
         editor=editor,
+        editors=editors,
     ):
         return False
 

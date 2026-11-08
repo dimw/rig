@@ -163,9 +163,12 @@ def test_resolve_and_apply_ignore_unknown_names():
     cfg = {}
     selected = apply_agent_selection(cfg, ["opencode", "claude"], default="nope")
     assert selected == ["opencode", "claude"]
-    assert cfg["type"] == "opencode"
+    assert cfg["default"] == "opencode"
+    assert cfg["enabled"] == ["opencode", "claude"]
+    assert "type" not in cfg
+    assert "types" not in cfg
     apply_agent_selection(cfg, ["opencode", "claude"], default="cursor")
-    assert cfg["type"] == "opencode"
+    assert cfg["default"] == "opencode"
 
 
 def test_parse_and_prompt_agent_selection_edges():
@@ -190,3 +193,16 @@ def test_resolve_configured_agents_prefers_types_and_default():
     installed, default = resolve_configured_agents({"type": "claude"})
     assert installed == ["claude"]
     assert default == "claude"
+    installed, default = resolve_configured_agents(
+        {"default": "claude", "type": "cursor", "types": ["opencode", "claude", "cursor"]}
+    )
+    assert default == "claude"
+    installed, default = resolve_configured_agents(
+        {
+            "default": "cursor",
+            "enabled": ["opencode", "cursor"],
+            "types": ["claude"],
+        }
+    )
+    assert installed == ["opencode", "cursor"]
+    assert default == "cursor"

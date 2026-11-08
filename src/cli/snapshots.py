@@ -72,14 +72,17 @@ def _project_merged_vars(project) -> Dict[str, Any]:
     cfg = dict(getattr(project, "config", None) or {})
     vars_cfg = dict(getattr(project, "vars_config", None) or {})
     merged = {**vars_cfg, **{k: v for k, v in cfg.items() if k not in ("playbooks",)}}
-    # Prefer agent.type / agent.types over the vars copies when both exist.
+    # Prefer agent.default / agent.enabled over the vars copies when both exist.
     agent = cfg.get("agent") or {}
-    if isinstance(agent, dict) and agent.get("type") and not isinstance(
-        agent.get("type"), (list, tuple)
-    ):
-        merged["coding_agent_type"] = agent["type"]
-    if isinstance(agent, dict) and agent.get("types"):
-        merged["coding_agent_types"] = list(agent["types"])
+    if isinstance(agent, dict):
+        default_agent = agent.get("default")
+        if default_agent in (None, "") or isinstance(default_agent, (list, tuple)):
+            default_agent = agent.get("type")
+        if default_agent and not isinstance(default_agent, (list, tuple)):
+            merged["coding_agent_type"] = default_agent
+        enabled_agents = agent.get("enabled") or agent.get("types")
+        if enabled_agents:
+            merged["coding_agent_types"] = list(enabled_agents)
     if "git_providers" not in merged and cfg.get("git_providers"):
         merged["git_providers"] = cfg["git_providers"]
     return merged

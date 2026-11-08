@@ -212,7 +212,7 @@ def test_interactive_init_defaults_to_current_repo(tmp_path):
 
     manifest = yaml.safe_load((rig / "rig.yml").read_text())
     assert manifest["name"] == "rig"
-    assert manifest["editor"] == "code"
+    assert manifest["editor"]["default"] == "code"
     assert [repo["name"] for repo in manifest["repos"]] == ["rig"]
 
 
@@ -313,8 +313,8 @@ def test_interactive_init_scaffolds_opencode_agent_files(tmp_path):
     )
 
     manifest = yaml.safe_load((rig / "rig.yml").read_text())
-    assert manifest["agent"]["type"] == "opencode"
-    assert manifest["editor"] == "cursor"
+    assert manifest["agent"]["default"] == "opencode"
+    assert manifest["editor"]["default"] == "cursor"
     assert (rig / ".rig" / "AGENTS.md").is_file()
     assert (rig / ".rig" / ".opencode" / "opencode.json").is_file()
     assert (rig / ".rig" / ".opencode" / "mcp.json").is_file()
@@ -346,8 +346,8 @@ def test_interactive_init_scaffolds_claude_agent_files(tmp_path):
     )
 
     manifest = yaml.safe_load((rig / "rig.yml").read_text())
-    assert manifest["agent"]["type"] == "claude"
-    assert manifest["editor"] == "code"
+    assert manifest["agent"]["default"] == "claude"
+    assert manifest["editor"]["default"] == "code"
     vars_data = yaml.load((rig / ".rig" / "vars.yml").read_text(), Loader=_VarsLoader)
     assert vars_data["coding_agent_type"] == "claude"
     assert (rig / ".rig" / "AGENTS.md").is_file()
@@ -374,8 +374,8 @@ def test_interactive_init_scaffolds_cursor_agent_files(tmp_path):
     )
 
     manifest = yaml.safe_load((rig / "rig.yml").read_text())
-    assert manifest["agent"]["type"] == "cursor"
-    assert manifest["editor"] == "code"
+    assert manifest["agent"]["default"] == "cursor"
+    assert manifest["editor"]["default"] == "code"
     vars_data = yaml.load((rig / ".rig" / "vars.yml").read_text(), Loader=_VarsLoader)
     assert vars_data["coding_agent_type"] == "cursor"
     assert (rig / ".rig" / ".cursor" / "cli-config.json").is_file()
@@ -406,13 +406,15 @@ def test_interactive_init_selects_multiple_agents(tmp_path):
     )
 
     manifest = yaml.safe_load((rig / "rig.yml").read_text())
-    assert manifest["agent"]["type"] == "claude"
-    assert manifest["agent"]["types"] == ["opencode", "claude"]
+    assert manifest["agent"]["default"] == "claude"
+    assert manifest["agent"]["enabled"] == ["opencode", "claude"]
     assert manifest["agent"]["credentials_var"] == "claude_api_key"
     assert manifest["agent"]["credentials"] == {
         "opencode": "opencode_api_key",
         "claude": "claude_api_key",
     }
+    assert manifest["editor"]["default"] == "code"
+    assert manifest["editor"]["enabled"] == ["code"]
     vars_data = yaml.load((rig / ".rig" / "vars.yml").read_text(), Loader=_VarsLoader)
     assert vars_data["coding_agent_type"] == "claude"
     assert vars_data["coding_agent_types"] == ["opencode", "claude"]
@@ -424,6 +426,29 @@ def test_interactive_init_selects_multiple_agents(tmp_path):
     authnz = (rig / ".rig" / "authorize.yml").read_text()
     assert "opencode_api_key" in authnz
     assert "claude_api_key" in authnz
+
+
+def test_interactive_init_selects_multiple_editors(tmp_path):
+    root = tmp_path / "mystack"
+    rig = root / "rig"
+    _git_init(rig, "https://github.com/mystack-cloud/rig.git")
+    data_key = tmp_path / "data-key"
+    data_key.write_text("vault-pass\n")
+
+    # projects, name, agent default, editors, default editor
+    answers = _answers("all", "rig", "", "1,3", "cursor")
+    assert interactive_env_init(
+        str(rig),
+        input_fn=lambda _prompt: next(answers),
+        secret_fn=_secrets(),
+        config_path=str(tmp_path / "rig-config"),
+        data_key_path=str(data_key),
+    )
+
+    manifest = yaml.safe_load((rig / "rig.yml").read_text())
+    assert manifest["editor"]["default"] == "cursor"
+    assert manifest["editor"]["enabled"] == ["code", "cursor"]
+    assert manifest["agent"]["default"] == "opencode"
 
 
 def test_interactive_init_stores_distinct_agent_api_keys(tmp_path):
