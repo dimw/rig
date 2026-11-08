@@ -1,0 +1,76 @@
+name: Release
+
+# Publishes to PyPI only when a version tag is pushed.
+# v1.2.3 and 1.2.3 both publish mystack-rig 1.2.3.
+# Create a repository Actions variable named PYPI_API_TOKEN
+# (a PyPI API token, including the pypi- prefix). The token is not printed.
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install build twine pytest pytest-cov mypy
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Type check
+        run: mypy src/ --ignore-missing-imports
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v -m "not e2e" --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=90 --ignore=tests/test_real_e2e_integration.py --ignore=tests/test_real_e2e_storage.py --ignore=tests/test_hetzner_storage.py
+
+      - name: Derive version from the release tag
+        id: version
+        run: |
+          version="$(python scripts/pypi_version.py "$GITHUB_REF_NAME")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Release version: $version (from tag $GITHUB_REF_NAME)"
+
+      - name: Build sdist and wheel
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.version.outputs.version }}
+        run: python -m build
+
+      - name: Require the built archives to match the tag
+        run: python scripts/pypi_version.py --check-dist dist "$GITHUB_REF_NAME"
+
+      - name: Check package metadata
+        run: python -m twine check dist/*
+
+      - name: Require the PyPI API token variable
+        env:
+          TWINE_PASSWORD: ${{ vars.PYPI_API_TOKEN }}
+        run: |
+          if [ -z "$TWINE_PASSWORD" ]; then
+            echo "Create a GitHub Actions variable named PYPI_API_TOKEN with a PyPI API token (include the pypi- prefix)."
+            exit 1
+          fi
+
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ vars.PYPI_API_TOKEN }}
+        run: python -m twine upload --non-interactive dist/*
