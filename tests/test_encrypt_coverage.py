@@ -91,6 +91,59 @@ def test_prompt_coding_agent_credentials(tmp_path, monkeypatch):
     store.assert_called()
 
 
+def test_coding_agent_key_env_selection_and_invalid_type(tmp_path, monkeypatch):
+    from cli import encrypt as enc
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "rig.yml").write_text("name: demo\nkind: workspace\n")
+    (tmp_path / ".rig").mkdir()
+
+    with patch("cli.encrypt.unlock_data_keys", return_value=("p", "s")), patch(
+        "cli.encrypt.store_encrypted_var"
+    ), patch("cli.encrypt._prompt_secret_with_env_fallback", return_value="") as ask:
+        assert (
+            enc.prompt_and_store_coding_agent_credentials(
+                project_dir=str(tmp_path),
+                agent_type="nope",
+                env_name="RIG_CUSTOM_AGENT_KEY",
+                input_fn=lambda *_: "",
+                secret_fn=lambda *_: "",
+            )
+            is False
+        )
+        assert "RIG_CUSTOM_AGENT_KEY" in ask.call_args.args[1]
+        assert (
+            enc.prompt_and_store_coding_agent_credentials(
+                project_dir=str(tmp_path),
+                agent_type="claude",
+                var_name="claude_api_key",
+                input_fn=lambda *_: "",
+                secret_fn=lambda *_: "",
+            )
+            is False
+        )
+        assert ask.call_args.args[1] == "RIG_ANTHROPIC_API_KEY"
+
+
+def test_multi_agent_keys_skip_each_provider(tmp_path, monkeypatch):
+    from cli import encrypt as enc
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "rig.yml").write_text("name: demo\nkind: workspace\n")
+    (tmp_path / ".rig").mkdir()
+
+    with patch("cli.encrypt.unlock_data_keys", return_value=("p", "s")), patch(
+        "cli.encrypt.store_encrypted_var"
+    ), patch("cli.encrypt._prompt_secret_with_env_fallback", return_value=""):
+        stored = enc.prompt_and_store_coding_agents_credentials(
+            ["opencode", "cursor", "claude"],
+            project_dir=str(tmp_path),
+            input_fn=lambda *_: "",
+            secret_fn=lambda *_: "",
+        )
+    assert stored == {"opencode": False, "cursor": False, "claude": False}
+
+
 def test_list_all_and_export_shared(tmp_path, monkeypatch):
     from cli import encrypt as enc
 

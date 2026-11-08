@@ -26,6 +26,7 @@ from cli.remote_dev import (  # noqa: E402
     RemoteDevManager,
     Workspace,
     build_rig_ansible_vars,
+    configured_agents,
     detect_client_public_ip,
     ensure_project_gitignore,
     normalize_editor_type,
@@ -1090,6 +1091,25 @@ class TestWorkspaceAndInteractive:
         ws = Workspace(str(tmp_path))
         assert ws.init(name="../bad") is False
 
+    def test_workspace_init_ignores_unknown_default_agent(self, tmp_path):
+        ws = Workspace(str(tmp_path))
+        assert ws.init(
+            name="ws",
+            agent_types=["opencode", "claude"],
+            agent_type="not-an-agent",
+        )
+        manifest = ws.manifest_path
+        import yaml
+        data = yaml.safe_load(open(manifest, encoding="utf-8"))
+        assert data["agent"]["type"] == "opencode"
+        assert data["agent"]["types"] == ["opencode", "claude"]
+
+    def test_configured_agents_without_project_and_non_member_default(self):
+        assert configured_agents(None) == (["opencode"], "opencode")
+        cfg = ProjectConfig("/tmp/unused-rig-agents")
+        cfg.config = {"agent": {"type": "cursor"}}
+        assert cfg._selected_default_agent(["opencode", "claude"]) == "opencode"
+
     def test_interactive_env_init_success(self, tmp_path, monkeypatch):
         root = tmp_path / "root"
         root.mkdir()
@@ -2003,6 +2023,32 @@ class TestInteractiveEnvInitBranches:
             )
             is False
         )
+
+    def test_string_agent_prompt_is_coerced(self, tmp_path, monkeypatch):
+        root = tmp_path / "ie-str"
+        root.mkdir()
+        (root / "svc").mkdir()
+        (root / "rig.yml").write_text("name: z\n", encoding="utf-8")
+        self._patch_core(
+            root,
+            [{"name": "svc", "path": str(root / "svc")}],
+            monkeypatch,
+        )
+        monkeypatch.setattr(
+            "cli.agents.prompt_coding_agents",
+            MagicMock(return_value="claude"),
+        )
+        inputs = iter(["all", "wspace"])
+        assert (
+            interactive_env_init(
+                start=str(root),
+                input_fn=lambda _: next(inputs),
+            )
+            is True
+        )
+        import yaml
+        manifest = yaml.safe_load((root / "rig.yml").read_text())
+        assert manifest["agent"]["type"] == "claude"
 
     def test_prompt_editor_value_error(self, tmp_path, monkeypatch):
         root = tmp_path / "ie6"

@@ -475,8 +475,6 @@ def parse_agent_selection(
         if agent not in seen:
             selected.append(agent)
             seen.add(agent)
-    if not selected:
-        raise ValueError("No coding agents selected")
     return selected
 
 
