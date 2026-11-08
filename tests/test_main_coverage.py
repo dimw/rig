@@ -328,11 +328,13 @@ def test_create_region_and_image_overrides(tok_env, tmp_path):
             )
             == 0
         )
-        vm = captured["kwargs"]["config"]["vm"]
-        assert vm["type"] == "large"
-        assert vm["availability_zone"] == "fsn1"
-        assert "region" not in vm
-        assert vm["image"] == "debian-12"
+        host = captured["kwargs"]["config"]["host"]
+        assert host["provider"] == "hetzner"
+        assert host["type"] == "vm"
+        assert host["server_type"] == "large"
+        assert host["availability_zone"] == "fsn1"
+        assert "region" not in host
+        assert host["image"] == "debian-12"
 
 
 def test_create_exception(tok_env, tmp_path, capsys):

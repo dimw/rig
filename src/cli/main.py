@@ -23,10 +23,13 @@ from cli.last_session import (
     resume_args_for_agent,
 )
 from cli.remote_dev import (
+    IMPLEMENTED_CLOUD_PROVIDERS,
     REMOTE_WORKSPACE_ROOT,
     ProjectConfig,
     RemoteDevEnvironment,
+    host_block,
     interactive_env_init,
+    normalize_cloud_provider,
 )
 
 
@@ -54,10 +57,6 @@ except ImportError:
 
 def _cmd_create(args: argparse.Namespace) -> int:
     _load_credentials()
-    hetzner_token = os.getenv('HETZNER_CLOUD_API_TOKEN')
-    if not hetzner_token:
-        log.error("Hetzner credentials missing. Run 'rig init' or set HETZNER_CLOUD_API_TOKEN")
-        return 1
 
     storage_manager = None
     try:
@@ -68,24 +67,36 @@ def _cmd_create(args: argparse.Namespace) -> int:
     try:
         project = ProjectConfig(os.getcwd())
         project.load()
-        vm_cfg = dict((project.config or {}).get("vm") or {})
+        host_cfg = host_block(project.config or {})
+        if getattr(args, "provider", None):
+            host_cfg["provider"] = normalize_cloud_provider(args.provider)
+        provider = host_cfg.get("provider")
+        if provider not in IMPLEMENTED_CLOUD_PROVIDERS:
+            available = ", ".join(sorted(IMPLEMENTED_CLOUD_PROVIDERS))
+            log.error(
+                "Cloud provider '%s' is not available yet (supported now: %s)",
+                provider,
+                available,
+            )
+            return 1
+        hetzner_token = os.getenv('HETZNER_CLOUD_API_TOKEN')
+        if not hetzner_token:
+            log.error(
+                "Hetzner credentials missing. "
+                "Run 'rig init' or set HETZNER_CLOUD_API_TOKEN"
+            )
+            return 1
         if getattr(args, "type", None):
-            vm_cfg["type"] = args.type
+            host_cfg["server_type"] = args.type
         if getattr(args, "availability_zone", None):
-            vm_cfg["availability_zone"] = args.availability_zone
-            vm_cfg.pop("region", None)
+            host_cfg["availability_zone"] = args.availability_zone
+            host_cfg.pop("region", None)
         if getattr(args, "image", None):
-            vm_cfg["image"] = args.image
-        vm_cfg.setdefault("type", "cax11")
-        vm_cfg.setdefault(
-            "availability_zone",
-            vm_cfg.pop("region", None) or "hel1",
-        )
-        vm_cfg.setdefault("image", "ubuntu-24.04")
+            host_cfg["image"] = args.image
 
         env = RemoteDevEnvironment(
             name=args.name,
-            config={"vm": vm_cfg},
+            config={"host": host_cfg},
             storage_manager=storage_manager,
         )
         force_system = bool(
@@ -806,21 +817,29 @@ def main(argv=None):
     )
     create_parser.add_argument("--name", help="Environment name")
     create_parser.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "Cloud provider (default: from rig.yml host.provider, else hetzner). "
+            "hetzner is available; aws and gcp are recognized but not yet"
+        ),
+    )
+    create_parser.add_argument(
         "--type",
         default=None,
-        help="VM type (default: from rig.yml vm.type, else cax11)",
+        help="Hetzner server type (default: from rig.yml host.server_type, else cax11)",
     )
     create_parser.add_argument(
         "--availability-zone",
         "--region",
         dest="availability_zone",
         default=None,
-        help="Hetzner location / AZ (default: from rig.yml vm.availability_zone, else hel1)",
+        help="Hetzner location / AZ (default: from rig.yml host.availability_zone, else hel1)",
     )
     create_parser.add_argument(
         "--image",
         default=None,
-        help="VM image (default: from rig.yml vm.image, else ubuntu-24.04)",
+        help="Boot image (default: from rig.yml host.image, else ubuntu-24.04)",
     )
     create_parser.add_argument(
         "--no-attach",

@@ -249,8 +249,82 @@ def test_env_reads_availability_zone_from_config():
         name="az-demo",
         config={"vm": {"type": "cax21", "availability_zone": "hel1"}},
     )
+    assert env.host_type == "vm"
     assert env.vm_type == "cax21"
     assert env.region == "hel1"
+
+
+def test_host_block_defaults_kind_and_reads_legacy_vm():
+    from cli.remote_dev import host_block
+
+    fresh = host_block({})
+    assert fresh["provider"] == "hetzner"
+    assert fresh["type"] == "vm"
+    assert fresh["server_type"] == "cax11"
+    assert fresh["availability_zone"] == "hel1"
+
+    legacy = host_block({"vm": {"type": "cax31", "region": "nbg1"}})
+    assert legacy["provider"] == "hetzner"
+    assert legacy["type"] == "vm"
+    assert legacy["server_type"] == "cax31"
+    assert legacy["availability_zone"] == "nbg1"
+    assert "region" not in legacy
+
+    explicit = host_block({
+        "host": {
+            "type": "vm",
+            "server_type": "cax21",
+            "availability_zone": "fsn1",
+        },
+        "vm": {"type": "cax11"},
+    })
+    assert explicit["type"] == "vm"
+    assert explicit["server_type"] == "cax21"
+    assert explicit["availability_zone"] == "fsn1"
+
+
+def test_env_reads_host_block():
+    env = RemoteDevEnvironment(
+        name="host-demo",
+        config={
+            "host": {
+                "server_type": "cax41",
+                "availability_zone": "fsn1",
+            }
+        },
+    )
+    assert env.provider == "hetzner"
+    assert env.host_type == "vm"
+    assert env.vm_type == "cax41"
+    assert env.region == "fsn1"
+
+
+def test_migrate_host_leaves_non_dict_and_absent_block(tmp_path):
+    cfg = ProjectConfig(str(tmp_path))
+    cfg.config = "nope"
+    cfg._migrate_host()
+    assert cfg.config == "nope"
+
+    cfg.config = {"name": "ws"}
+    cfg._migrate_host()
+    assert "host" not in cfg.config
+    assert "vm" not in cfg.config
+
+
+def test_reinit_renames_vm_block_to_host(tmp_path):
+    cfg = ProjectConfig(str(tmp_path))
+    assert cfg.init(name="ws", agent_type="opencode")
+    cfg.config.pop("host")
+    cfg.config["vm"] = {"type": "cax21", "region": "fsn1", "image": "debian-12"}
+    cfg.save(write_vars=False)
+
+    again = ProjectConfig(str(tmp_path))
+    assert again.init(name="ws")
+    assert again.config["host"]["type"] == "vm"
+    assert again.config["host"]["server_type"] == "cax21"
+    assert again.config["host"]["availability_zone"] == "fsn1"
+    assert again.config["host"]["image"] == "debian-12"
+    assert "vm" not in again.config
 
 
 def test_env_falls_back_to_legacy_region_key():
@@ -265,8 +339,8 @@ def test_create_uses_vm_from_rig_yml(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     cfg = ProjectConfig(str(tmp_path))
     assert cfg.init(name="ws", agent_type="opencode")
-    cfg.set("vm.type", "cax31")
-    cfg.set("vm.availability_zone", "hel1")
+    cfg.set("host.server_type", "cax31")
+    cfg.set("host.availability_zone", "hel1")
     cfg.save(write_vars=False)
 
     monkeypatch.setenv("HETZNER_CLOUD_API_TOKEN", "token")
@@ -286,8 +360,10 @@ def test_create_uses_vm_from_rig_yml(tmp_path, monkeypatch):
     ):
         assert main(["create", "--name", "from-yml"]) == 1
 
-    assert captured["config"]["vm"]["type"] == "cax31"
-    assert captured["config"]["vm"]["availability_zone"] == "hel1"
+    assert captured["config"]["host"]["provider"] == "hetzner"
+    assert captured["config"]["host"]["type"] == "vm"
+    assert captured["config"]["host"]["server_type"] == "cax31"
+    assert captured["config"]["host"]["availability_zone"] == "hel1"
 
 
 def test_run_all_playbooks_logs_command(tmp_path, capsys):
@@ -341,3 +417,50 @@ def test_playbook_fails_when_no_hosts_matched(tmp_path):
     )
     with patch("cli.remote_dev.subprocess.run", return_value=fake):
         assert manager.run_playbook(stream=False) is False
+
+
+def test_cloud_provider_defaults_and_aliases():
+    from cli.remote_dev import host_block, normalize_cloud_provider
+
+    assert normalize_cloud_provider(None) == "hetzner"
+    assert normalize_cloud_provider("  Hetzner Cloud ") == "hetzner"
+    assert normalize_cloud_provider("hcloud") == "hetzner"
+    assert normalize_cloud_provider("Amazon") == "aws"
+    assert host_block({"host": {"provider": 1}})["provider"] == "hetzner"
+    with pytest.raises(ValueError, match="Unsupported cloud provider"):
+        normalize_cloud_provider("azure")
+
+
+def test_unimplemented_provider_is_refused():
+    with pytest.raises(ValueError, match="not available yet"):
+        RemoteDevEnvironment(
+            name="aws-later",
+            config={"host": {"provider": "aws", "type": "vm"}},
+        )
+
+
+def test_create_provider_override(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    cfg = ProjectConfig(str(tmp_path))
+    assert cfg.init(name="ws", agent_type="opencode")
+    monkeypatch.setenv("HETZNER_CLOUD_API_TOKEN", "token")
+    captured = {}
+
+    class FakeEnv:
+        def __init__(self, name=None, config=None, storage_manager=None):
+            captured["config"] = config
+            self.name = name or "dev-x"
+
+        def setup(self, project_dir=None):
+            return False
+
+    with patch("cli.main.RemoteDevEnvironment", FakeEnv), patch(
+        "cli.main.StorageManager", side_effect=ValueError("no storage")
+    ):
+        assert main(["create", "--name", "from-flag", "--provider", "hcloud"]) == 1
+        assert main(["create", "--provider", "gcp"]) == 1
+
+    assert captured["config"]["host"]["provider"] == "hetzner"
+    err = capsys.readouterr().err
+    assert "not available yet" in err
+    assert "gcp" in err

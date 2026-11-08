@@ -18,8 +18,8 @@ from cli.remote_dev import (
 def test_build_rig_ansible_vars_includes_core_fields(tmp_path):
     cfg = ProjectConfig(str(tmp_path))
     assert cfg.init(name="estasify", agent_type="opencode")
-    cfg.set("vm.type", "cax21")
-    cfg.set("vm.availability_zone", "hel1")
+    cfg.set("host.server_type", "cax21")
+    cfg.set("host.availability_zone", "hel1")
     cfg.save(write_vars=False)
     cfg.load()
 
@@ -34,6 +34,7 @@ def test_build_rig_ansible_vars_includes_core_fields(tmp_path):
     vars_out = build_rig_ansible_vars(env, cfg, action="create")
     assert vars_out["rig_env_name"] == "dev-abc123"
     assert vars_out["rig_workspace_name"] == "estasify"
+    assert vars_out["rig_cloud_provider"] == "hetzner"
     assert vars_out["rig_vm_type"] == "cax21"
     assert vars_out["rig_availability_zone"] == "hel1"
     assert vars_out["rig_vm_ip"] == "203.0.113.10"

@@ -436,6 +436,77 @@ def ensure_project_gitignore(project_dir: str) -> List[str]:
     return missing
 
 
+# ``host.provider`` is the cloud. ``host.type`` is the kind of machine.
+# ``host.server_type`` is the Hetzner size.
+HOST_KIND_VM = "vm"
+HOST_KINDS = frozenset({HOST_KIND_VM})
+DEFAULT_SERVER_TYPE = "cax11"
+CLOUD_PROVIDER_HETZNER = "hetzner"
+# Recognized names. Only Hetzner can provision today.
+RECOGNIZED_CLOUD_PROVIDERS = frozenset({CLOUD_PROVIDER_HETZNER, "aws", "gcp"})
+IMPLEMENTED_CLOUD_PROVIDERS = frozenset({CLOUD_PROVIDER_HETZNER})
+CLOUD_PROVIDER_ALIASES = {
+    "hetzner": CLOUD_PROVIDER_HETZNER,
+    "hetzner-cloud": CLOUD_PROVIDER_HETZNER,
+    "hcloud": CLOUD_PROVIDER_HETZNER,
+    "aws": "aws",
+    "amazon": "aws",
+    "gcp": "gcp",
+    "google": "gcp",
+}
+
+
+def normalize_cloud_provider(value: Optional[str]) -> str:
+    """Normalize a cloud provider name. Empty means Hetzner."""
+    raw = (value or "").strip().lower().replace(" ", "-").replace("_", "-")
+    if not raw:
+        return CLOUD_PROVIDER_HETZNER
+    provider = CLOUD_PROVIDER_ALIASES.get(raw, raw)
+    if provider not in RECOGNIZED_CLOUD_PROVIDERS:
+        known = ", ".join(sorted(RECOGNIZED_CLOUD_PROVIDERS))
+        raise ValueError(
+            f"Unsupported cloud provider {value!r}. Choose one of: {known}"
+        )
+    return provider
+
+
+def host_block(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Normalized ``host`` settings.
+
+    ``provider`` defaults to ``hetzner`` and ``type`` defaults to ``vm``.
+    A legacy ``vm`` block, or a ``type`` that is really a Hetzner server size,
+    is accepted. ``region`` is read as ``availability_zone``.
+    """
+    config = config or {}
+    raw = config.get("host")
+    source = raw if isinstance(raw, dict) else config.get("vm")
+    block = dict(source) if isinstance(source, dict) else {}
+    kind = block.get("type")
+    kind_name = kind.strip().lower() if isinstance(kind, str) else ""
+    if kind_name in HOST_KINDS:
+        block["type"] = kind_name
+    elif kind not in (None, ""):
+        if "server_type" not in block:
+            block["server_type"] = kind
+        block["type"] = HOST_KIND_VM
+    else:
+        block["type"] = HOST_KIND_VM
+    block["provider"] = normalize_cloud_provider(
+        block.get("provider") if isinstance(block.get("provider"), str) else None
+    )
+    if not block.get("server_type"):
+        block["server_type"] = DEFAULT_SERVER_TYPE
+    if not block.get("availability_zone"):
+        region = block.pop("region", None)
+        block["availability_zone"] = region or "hel1"
+    else:
+        block.pop("region", None)
+    if not block.get("image"):
+        block["image"] = "ubuntu-24.04"
+    return block
+
+
 def configured_agents(project) -> Tuple[List[str], str]:
     """Installed coding agents and the default attach target for a project."""
     from cli.agents import resolve_configured_agents
@@ -462,7 +533,7 @@ def build_rig_ansible_vars(
     reference environment identity without hard-coding it.
     """
     cfg = (project.config if project else None) or {}
-    vm_cfg = cfg.get("vm") or {}
+    host_cfg = host_block(cfg)
     repos = [
         {
             "name": repo.get("name"),
@@ -489,16 +560,20 @@ def build_rig_ansible_vars(
     vars_out: Dict[str, Any] = {
         "rig_env_name": env.name if env else "",
         "rig_workspace_name": workspace_name,
+        "rig_cloud_provider": host_cfg.get("provider") or CLOUD_PROVIDER_HETZNER,
         "rig_vm_name": (env.vm_name if env else None) or (env.name if env else ""),
-        "rig_vm_type": (env.vm_type if env else None) or vm_cfg.get("type") or "cax11",
+        "rig_vm_type": (
+            (env.vm_type if env else None)
+            or host_cfg.get("server_type")
+            or DEFAULT_SERVER_TYPE
+        ),
         "rig_availability_zone": (
             (env.region if env else None)
-            or vm_cfg.get("availability_zone")
-            or vm_cfg.get("region")
+            or host_cfg.get("availability_zone")
             or "hel1"
         ),
         "rig_vm_image": str(
-            (env.image if env else None) or vm_cfg.get("image") or "ubuntu-24.04"
+            (env.image if env else None) or host_cfg.get("image") or "ubuntu-24.04"
         ),
         "rig_vm_ip": (env.vm_ip if env else None) or "",
         "rig_vm_id": str(env.vm_id) if env and env.vm_id is not None else "",
@@ -1258,19 +1333,23 @@ class RemoteDevEnvironment:
         self.name = name or f"dev-{uuid.uuid4().hex[:8]}"
         self.config = config or {}
 
+        # Host details. provider is the cloud; type is the kind (vm).
+        host = host_block(self.config)
+        self.provider = host.get("provider") or CLOUD_PROVIDER_HETZNER
+        self.vm_name = self.name
+        self.host_type = host.get("type") or HOST_KIND_VM
+        self.vm_type = host.get("server_type") or DEFAULT_SERVER_TYPE
+        self.region = host.get("availability_zone") or "hel1"
+        self.image = host.get("image") or "ubuntu-24.04"
+        if self.provider not in IMPLEMENTED_CLOUD_PROVIDERS:
+            available = ", ".join(sorted(IMPLEMENTED_CLOUD_PROVIDERS))
+            raise ValueError(
+                f"Cloud provider {self.provider!r} is not available yet "
+                f"(supported now: {available})"
+            )
+
         self.hetzner_token = os.getenv('HETZNER_CLOUD_API_TOKEN')
         self.manager = RemoteDevManager(self.hetzner_token, storage_manager)
-
-        # VM details (availability_zone is the Hetzner location, e.g. hel1)
-        vm = self.config.get("vm") or {}
-        self.vm_name = self.name
-        self.vm_type = vm.get("type") or "cax11"
-        self.region = (
-            vm.get("availability_zone")
-            or vm.get("region")
-            or "hel1"
-        )
-        self.image = vm.get("image") or "ubuntu-24.04"
 
         # SSH key
         self.ssh_key_name = f"{self.name}-key"
@@ -2717,9 +2796,10 @@ if __name__ == '__main__':
 
     # Example configuration
     config = {
-        'vm': {
-            'name': 'my-dev-env',
-            'type': 'cax11',
+        'host': {
+            'provider': 'hetzner',
+            'type': 'vm',
+            'server_type': 'cax11',
             'availability_zone': 'hel1',
             'image': 'ubuntu-24.04'
         },
@@ -3432,8 +3512,10 @@ class ProjectConfig:
             "description": "Remote environment",
             "ansible_enabled": ansible_enabled,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "vm": {
-                "type": "cax11",
+            "host": {
+                "provider": CLOUD_PROVIDER_HETZNER,
+                "type": HOST_KIND_VM,
+                "server_type": DEFAULT_SERVER_TYPE,
                 "availability_zone": "hel1",
                 "image": "ubuntu-24.04",
             },
@@ -3730,6 +3812,15 @@ class ProjectConfig:
         self.config.pop("default_editor", None)
         self.config.pop("editors", None)
 
+    def _migrate_host(self) -> None:
+        """Rename ``vm`` to ``host`` and split the server size from ``type``."""
+        if not isinstance(self.config, dict):
+            return
+        if "host" not in self.config and "vm" not in self.config:
+            return
+        self.config["host"] = host_block(self.config)
+        self.config.pop("vm", None)
+
     def _selected_default_agent(self, selected: List[str]) -> str:
         from cli.agents import agent_default_field
 
@@ -3757,6 +3848,7 @@ class ProjectConfig:
                 created.append(self.RIG_YAML)
             else:
                 self._migrate_default_names()
+                self._migrate_host()
                 before = yaml.dump(self.config, sort_keys=True)
                 if name and not self.config.get("name"):
                     self.config["name"] = name

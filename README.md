@@ -19,11 +19,13 @@ Run `rig` from your machine, CI/CD, or a control plane: it provisions cloud VMs 
 
 ## Cloud providers
 
-| Provider | Status |
-| --- | --- |
-| [Hetzner Cloud](https://www.hetzner.com/cloud) | Supported (VMs, firewall, snapshots, S3-compatible object storage) |
-| [AWS](https://aws.amazon.com/) | Coming next |
-| [GCP](https://cloud.google.com/) | Coming next |
+| Provider | `host.provider` | Status |
+| --- | --- | --- |
+| [Hetzner Cloud](https://www.hetzner.com/cloud) | `hetzner` (default) | Supported (VMs, firewall, snapshots, S3-compatible object storage) |
+| [AWS](https://aws.amazon.com/) | `aws` | Coming next |
+| [GCP](https://cloud.google.com/) | `gcp` | Coming next |
+
+`rig create` reads `host.provider`. Omit it and the provider is Hetzner. `--provider` overrides the file. `aws` and `gcp` are accepted as names and refused until those clouds can provision.
 
 ## Coding agents
 
@@ -74,8 +76,10 @@ rig.yml                 # workspace manifest (vm, agent, playbooks, repos)
 `rig.yml` defaults (edit to configure):
 
 ```yaml
-vm:
-  type: cax11
+host:
+  provider: hetzner        # hetzner (default) | aws | gcp
+  type: vm                 # kind of machine; vm is the default
+  server_type: cax11       # Hetzner server type
   availability_zone: hel1
   image: ubuntu-24.04
 firewall:
@@ -180,7 +184,7 @@ Global: `-v` debug · `-q` warnings/errors only · `--version`
 | Command | Args | Notes |
 | --- | --- | --- |
 | `init` | | Interactive scaffold |
-| `create` | `[--name]` `[--type]` `[--availability-zone]` `[--image]` `[--no-attach]` `[--force-playbooks\|--force-system\|--force-workspace]` | VM defaults from `rig.yml`; flags override. `--region` aliases `--availability-zone`. |
+| `create` | `[--name]` `[--provider]` `[--type]` `[--availability-zone]` `[--image]` `[--no-attach]` `[--force-playbooks\|--force-system\|--force-workspace]` | Host defaults from `rig.yml`. `--provider` defaults to `hetzner`. `--type` sets `host.server_type`. `host.type` defaults to `vm`. `--region` aliases `--availability-zone`. |
 | `apply` | `[name]` `[--provision\|--configure\|--authorize\|--materialize]` | Default: authorize then materialize |
 | `attach` | `[name]` `[-c\|--continue]` `[-s\|--session ID]` `[--resume [ID]]` `[--agent opencode\|claude\|cursor]` `[-- …agent args]` | Reopens last remembered session by default; `--agent` picks which installed agent |
 | `dev` | `[name]` `[--path /workspace]` `[--browser]` `[--editor code\|cursor\|…]` | Remote-SSH by default; `--editor` opens another IDE from `editor.enabled`. Defaults to `editor.default` |
@@ -201,7 +205,8 @@ Playbooks load `.rig/vars.yml` then `.rig/vars.{identity}.yml` (personal wins), 
 | `rig_env_name` | Env / VM name (`dev-…`) |
 | `rig_workspace_name` | `rig.yml` `name` |
 | `rig_vm_name` | VM name (usually same as env) |
-| `rig_vm_type` | Hetzner server type |
+| `rig_cloud_provider` | Cloud provider (`host.provider`, default `hetzner`) |
+| `rig_vm_type` | Hetzner server type (`host.server_type`) |
 | `rig_availability_zone` | Hetzner location (`hel1`, …) |
 | `rig_vm_image` | Boot image or snapshot id |
 | `rig_vm_ip` | Public IPv4 |

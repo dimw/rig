@@ -287,7 +287,7 @@ class TestProjectConfig(unittest.TestCase):
             config.init(name='test-project')
 
             # Modify config
-            config.set('vm.availability_zone', 'hel1')
+            config.set('host.availability_zone', 'hel1')
             config.set_vars('ansible_user', 'root')
 
             # Save and reload
@@ -296,9 +296,10 @@ class TestProjectConfig(unittest.TestCase):
             new_config = ProjectConfig(temp_dir)
             new_config.load()
 
-            self.assertEqual(new_config.get('vm.availability_zone'), 'hel1')
+            self.assertEqual(new_config.get('host.availability_zone'), 'hel1')
             self.assertEqual(new_config.get_vars('ansible_user'), 'root')
-            self.assertEqual(new_config.get('vm.type'), 'cax11')
+            self.assertEqual(new_config.get('host.type'), 'vm')
+            self.assertEqual(new_config.get('host.server_type'), 'cax11')
         finally:
             shutil.rmtree(temp_dir)
 
