@@ -40,7 +40,7 @@ def test_ensure_gitignore_appends_to_existing(tmp_path):
     assert text.startswith("node_modules/\n.env\n")
     assert GITIGNORE_MARKER_BEGIN in text
     assert ".rig/roles/" in text
-    assert ".rig/galaxy_roles/" in text
+    assert "galaxy_roles" not in text
     assert "local_roles" not in text
 
 

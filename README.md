@@ -56,7 +56,7 @@ Chosen at `rig init` (`editor.enabled` in `rig.yml`, same multi-select as git pr
 
 ```text
 rig.yml                 # workspace manifest (vm, agent, playbooks, repos)
-.gitignore              # adds .rig/collections, roles, galaxy_roles, inventory (via init)
+.gitignore              # adds .rig/collections, roles, inventory (via init)
 .rig/
   provision.yml         # managed; create base environment (cached)
   configure.yml         # user; image/service customizations (cached)
@@ -71,10 +71,10 @@ rig.yml                 # workspace manifest (vm, agent, playbooks, repos)
   AGENTS.md             # agent instructions
   .opencode/ | .claude/ | .cursor/  # agent config + MCP
   inventory.yml         # generated at create/apply (gitignored)
-  collections/ galaxy_roles/ roles/   # Galaxy installs (gitignored)
+  collections/ roles/    # Galaxy installs (gitignored)
 ```
 
-Put a committed role at `.rig/local_roles/<name>/` (`tasks/main.yml` and the usual role layout). `rig init` creates the directory. Galaxy roles install into `.rig/galaxy_roles/` and stay gitignored, as do any older installs still under `.rig/roles/`. Ansible checks `.rig/roles/` before the configured path, so a Galaxy install found there is moved to `galaxy_roles` and `local_roles` is searched first.
+Put a committed role at `.rig/local_roles/<name>/` (`tasks/main.yml` and the usual role layout). `rig init` creates the directory. Galaxy roles install into `.rig/roles/` and stay gitignored. Ansible checks that directory before the configured path, so each committed role is linked there and wins over a Galaxy role of the same name. An older `.rig/galaxy_roles/` directory is moved into `roles` on the next init or apply.
 
 `rig.yml` defaults (edit to configure):
 
