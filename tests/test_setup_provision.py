@@ -693,7 +693,8 @@ def test_verbose_playbook_streams_tasks_and_passes_ansible_verbosity(tmp_path, m
     assert "-vv" in captured["cmd"]
     search = captured["env"]["ANSIBLE_ROLES_PATH"].split(os.pathsep)
     assert search[0].endswith(os.path.join(".rig", "local_roles"))
-    assert search[1].endswith(os.path.join(".rig", "galaxy_roles"))
+    assert search[1].endswith(os.path.join(".rig", "roles"))
+    assert len(search) == 2
     rig_log.configure_logging()
 
 
