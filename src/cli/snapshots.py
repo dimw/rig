@@ -128,6 +128,26 @@ def _hash_bytes(*parts: bytes) -> str:
     return digest.hexdigest()[:12]
 
 
+def _local_roles_bytes(project_dir: Optional[str]) -> bytes:
+    """Stable digest of committed roles. Galaxy installs are not included."""
+    if not project_dir:
+        return b""
+    root = os.path.join(project_dir, ".rig", "local_roles")
+    if not os.path.isdir(root):
+        return b""
+    chunks: List[bytes] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(filenames):
+            if name == ".gitkeep":
+                continue
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            chunks.append(rel.encode("utf-8"))
+            chunks.append(_read_text(path).encode("utf-8"))
+    return b"\0".join(chunks)
+
+
 def _read_text(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -150,7 +170,9 @@ def system_content_hash(
     """
     Hash for system snapshots: var map + ``provision.yml`` + ``configure.yml``.
 
-    ``editor`` is ignored (local IDE only; not installed by system.yml).
+    Committed roles under ``.rig/local_roles`` are included when present.
+    ``.gitkeep`` alone does not change the hash. ``editor`` is ignored
+    (local IDE only; not installed by system.yml).
     """
     if var_map is None and project is not None:
         var_map = extract_snapshot_var_map(project, SYSTEM_SNAPSHOT_VAR_KEYS)
@@ -163,10 +185,10 @@ def system_content_hash(
 
     body = playbook_body
     configure_body = ""
+    root = project_dir
+    if root is None and project is not None:
+        root = getattr(project, "project_dir", None)
     if body is None:
-        root = project_dir
-        if root is None and project is not None:
-            root = getattr(project, "project_dir", None)
         if root:
             body = _read_text(os.path.join(root, ".rig", "provision.yml"))
             if not body:
@@ -187,14 +209,18 @@ def system_content_hash(
             except Exception:
                 configure_body = ""
 
-    return _hash_bytes(
+    local_roles = _local_roles_bytes(root)
+    parts = [
         b"system-vars",
         _canonical_json(var_map).encode("utf-8"),
         b"provision-playbook",
         (body or "").encode("utf-8"),
         b"configure-playbook",
         (configure_body or "").encode("utf-8"),
-    )
+    ]
+    if local_roles:
+        parts.extend([b"local-roles", local_roles])
+    return _hash_bytes(*parts)
 
 
 def iter_workspace_hash_paths(project_dir: str) -> List[str]:

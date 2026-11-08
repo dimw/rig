@@ -37,9 +37,14 @@ def test_main_accepts_verbose_and_quiet_flags():
 
     with patch("cli.main._cmd_list", return_value=0) as listed:
         assert main(["-v", "list"]) == 0
+        assert rig_log.verbosity() == 1
+        assert rig_log.get_logger().level == logging.DEBUG
+        assert main(["-vvv", "list"]) == 0
+        assert rig_log.verbosity() == 3
         assert main(["-q", "list"]) == 0
-        assert listed.call_count == 2
-    assert rig_log.get_logger().level in (logging.DEBUG, logging.WARNING, logging.INFO)
+        assert rig_log.verbosity() == 0
+        assert listed.call_count == 3
+    assert rig_log.get_logger().level == logging.WARNING
 
 
 def test_logger_name_is_rig():

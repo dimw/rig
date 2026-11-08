@@ -1,7 +1,11 @@
 """Shared CLI logging for rig.
 
-Default level is INFO. Use ``rig -v`` / ``--verbose`` for DEBUG detail, or
-``rig -q`` / ``--quiet`` for warnings and errors only.
+Default level is INFO: lifecycle lines only. Playbook task output is shown
+when a task fails, or when verbosity is raised.
+
+``rig -v`` streams each playbook task and turns on DEBUG. ``-vv``, ``-vvv``,
+and ``-vvvv`` pass that same verbosity through to ansible-playbook.
+``rig -q`` / ``--quiet`` shows warnings and errors only.
 
 Format (stderr): INFO is message-only; DEBUG/WARNING/ERROR keep a level prefix.
 Stdout stays free for command output (encrypt ciphertext, decrypt plaintext, etc.).
@@ -15,6 +19,7 @@ from typing import Optional
 
 LOGGER_NAME = "rig"
 _CONFIGURED = False
+_VERBOSITY = 0
 
 
 class _LevelFormatter(logging.Formatter):
@@ -36,20 +41,30 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
     return logging.getLogger(LOGGER_NAME)
 
 
+def verbosity() -> int:
+    """How much detail the current command asked for. ``0`` is the default."""
+    return _VERBOSITY
+
+
 def configure_logging(
     *,
     verbose: bool = False,
     quiet: bool = False,
     level: Optional[int] = None,
+    verbosity: Optional[int] = None,
 ) -> logging.Logger:
     """
     Configure the root ``rig`` logger once (or reconfigure on subsequent calls).
 
-    Precedence: explicit ``level`` > ``verbose`` > ``quiet`` > INFO.
+    ``verbosity`` counts ``-v`` flags. Precedence for the level: explicit
+    ``level`` > any verbosity or ``verbose`` > ``quiet`` > INFO.
     """
-    global _CONFIGURED
+    global _CONFIGURED, _VERBOSITY
+    if verbosity is None:
+        verbosity = 1 if verbose else 0
+    _VERBOSITY = max(0, int(verbosity))
     if level is None:
-        if verbose:
+        if _VERBOSITY > 0 or verbose:
             level = logging.DEBUG
         elif quiet:
             level = logging.WARNING

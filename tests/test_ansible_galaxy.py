@@ -30,14 +30,43 @@ def test_setup_requirements_writes_collections_and_roles(tmp_path):
     assert mgr.setup_requirements() is True
 
 
-def test_setup_roles_creates_default_role(tmp_path):
+def test_setup_roles_creates_local_and_galaxy_dirs(tmp_path):
     cfg = ProjectConfig(str(tmp_path))
     assert cfg.init(name="ws", agent_type="opencode")
     mgr = AnsibleManager(cfg)
     mgr.configure(str(tmp_path))
     assert mgr.setup_roles() is True
-    role_tasks = tmp_path / ".rig" / "roles" / "default_role" / "tasks" / "main.yml"
-    assert role_tasks.is_file()
+    assert (tmp_path / ".rig" / "local_roles" / ".gitkeep").is_file()
+    assert (tmp_path / ".rig" / "galaxy_roles").is_dir()
+    assert not (tmp_path / ".rig" / "roles" / "default_role").exists()
+
+
+def test_galaxy_roles_move_out_of_the_playbook_roles_dir(tmp_path):
+    from cli.remote_dev import relocate_installed_galaxy_roles, roles_search_path
+
+    cfg = ProjectConfig(str(tmp_path))
+    assert cfg.init(name="ws", agent_type="opencode")
+    legacy = tmp_path / ".rig" / "roles" / "geerlingguy.docker" / "meta"
+    legacy.mkdir(parents=True)
+    (legacy / ".galaxy_install_info").write_text("version: 1\n")
+    handmade = tmp_path / ".rig" / "roles" / "kept"
+    handmade.mkdir()
+    (handmade / "tasks").mkdir()
+
+    moved = relocate_installed_galaxy_roles(cfg.rig_dir)
+    assert moved == ["geerlingguy.docker"]
+    assert (tmp_path / ".rig" / "galaxy_roles" / "geerlingguy.docker" / "meta" / ".galaxy_install_info").is_file()
+    assert handmade.is_dir()
+    again = tmp_path / ".rig" / "roles" / "geerlingguy.docker" / "meta"
+    again.mkdir(parents=True)
+    (again / ".galaxy_install_info").write_text("version: 1\n")
+    assert relocate_installed_galaxy_roles(cfg.rig_dir) == []
+    assert again.is_dir()
+    assert relocate_installed_galaxy_roles(str(tmp_path / "missing")) == []
+
+    path = roles_search_path(cfg.rig_dir)
+    assert path.split(os.pathsep)[0].endswith(os.path.join(".rig", "local_roles"))
+    assert path.split(os.pathsep)[1].endswith(os.path.join(".rig", "galaxy_roles"))
 
 
 def test_install_roles_invokes_ansible_galaxy(tmp_path):
@@ -52,8 +81,11 @@ def test_install_roles_invokes_ansible_galaxy(tmp_path):
     commands = [" ".join(call.args[0]) for call in run.call_args_list]
     assert any("ansible-galaxy collection install" in cmd for cmd in commands)
     assert any("ansible-galaxy role install" in cmd for cmd in commands)
+    role_cmd = next(cmd for cmd in commands if "ansible-galaxy role install" in cmd)
+    assert f"-p {tmp_path / '.rig' / 'galaxy_roles'}" in role_cmd
+    assert "local_roles" in mgr.ansible_env["ANSIBLE_ROLES_PATH"].split(os.pathsep)[0]
     assert (tmp_path / ".rig" / "collections").is_dir()
-    assert (tmp_path / ".rig" / "roles").is_dir()
+    assert (tmp_path / ".rig" / "galaxy_roles").is_dir()
 
 
 def test_setup_bootstrap_wires_components(tmp_path):

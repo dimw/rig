@@ -135,6 +135,14 @@ def test_workspace_hash_ignores_inventory_system_and_roles(tmp_path):
     (roles / "meta" / ".galaxy_install_info").write_text("version: 1.0.0\n")
     assert workspace_content_hash(str(tmp_path)) == baseline
 
+    system_before = system_content_hash(project_dir=str(tmp_path), playbook_body="prov")
+    local = rig / "local_roles" / "app"
+    local.mkdir(parents=True)
+    (local / ".gitkeep").write_text("")
+    assert system_content_hash(project_dir=str(tmp_path), playbook_body="prov") == system_before
+    (local / "tasks.yml").write_text("- debug:\n")
+    assert system_content_hash(project_dir=str(tmp_path), playbook_body="prov") != system_before
+
     # Agent scaffolds / authnz / AGENTS.md do not affect workspace hash.
     (rig / "AGENTS.md").write_text("# rules\n")
     (rig / "authorize.yml").write_text("---\n")
