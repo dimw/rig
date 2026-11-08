@@ -794,8 +794,12 @@ def main(argv=None):
     parser.add_argument(
         "-v",
         "--verbose",
-        action="store_true",
-        help="Show debug logs (IDs, playbook paths, SSH details)",
+        action="count",
+        default=0,
+        help=(
+            "More detail. -v shows each playbook task and debug logs; "
+            "-vv, -vvv, and -vvvv pass that verbosity to ansible-playbook"
+        ),
     )
     parser.add_argument(
         "-q",
@@ -1112,9 +1116,11 @@ def main(argv=None):
     )
 
     args = parser.parse_args(argv)
+    verbosity = int(getattr(args, "verbose", 0) or 0)
     log.configure_logging(
-        verbose=bool(getattr(args, "verbose", False)),
+        verbose=verbosity > 0,
         quiet=bool(getattr(args, "quiet", False)),
+        verbosity=verbosity,
     )
 
     if args.command == "init":

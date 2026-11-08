@@ -40,6 +40,8 @@ def test_ensure_gitignore_appends_to_existing(tmp_path):
     assert text.startswith("node_modules/\n.env\n")
     assert GITIGNORE_MARKER_BEGIN in text
     assert ".rig/roles/" in text
+    assert ".rig/galaxy_roles/" in text
+    assert "local_roles" not in text
 
 
 def test_ensure_gitignore_skips_entries_already_present(tmp_path):
@@ -71,3 +73,5 @@ def test_project_init_writes_gitignore(tmp_path):
     text = (tmp_path / ".gitignore").read_text()
     for entry in GITIGNORE_ENTRIES:
         assert entry in text
+    assert (tmp_path / ".rig" / "local_roles" / ".gitkeep").is_file()
+    assert "local_roles" not in text

@@ -377,13 +377,45 @@ def test_run_all_playbooks_logs_command(tmp_path, capsys):
     (tmp_path / "inventory.yml").write_text("all: {}\n")
 
     rig_log.configure_logging(verbose=True)
-    with patch("cli.remote_dev.subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
+    with patch(
+        "cli.remote_dev.subprocess.run",
+        return_value=MagicMock(returncode=0, stdout="ok: [remote_vm]\n", stderr=""),
+    ):
         assert manager.run_all_playbooks(stream=False) is True
 
     err = capsys.readouterr().err
     assert "ansible-playbook" in err
     assert "provision.yml" in err
     assert "@" in err  # -e @vars.yml
+
+
+def test_setup_paths_are_debug_only(tmp_path, capsys):
+    from cli import log as rig_log
+
+    cfg = ProjectConfig(str(tmp_path))
+    cfg.init(name="paths", agent_type="opencode")
+    manager = AnsibleManager(cfg)
+    manager.configure(str(tmp_path))
+
+    rig_log.configure_logging()
+    capsys.readouterr()
+    assert manager.setup_inventory("1.2.3.4", "/tmp/key")
+    assert manager.setup_playbook()
+    quiet = capsys.readouterr()
+    assert "inventory.yml" not in quiet.out
+    assert "provision.yml" not in quiet.out
+    assert "materialize.yml" not in quiet.out
+    assert "inventory.yml" not in quiet.err
+
+    rig_log.configure_logging(verbose=True)
+    capsys.readouterr()
+    assert manager.setup_inventory("1.2.3.4", "/tmp/key")
+    assert manager.setup_playbook()
+    verbose = capsys.readouterr()
+    assert "inventory.yml" in verbose.err
+    assert "provision.yml" in verbose.err
+    assert "materialize.yml" in verbose.err
+    rig_log.configure_logging()
 
 
 def test_setup_inventory_excludes_vault_secrets(tmp_path):
@@ -417,6 +449,150 @@ def test_playbook_fails_when_no_hosts_matched(tmp_path):
     )
     with patch("cli.remote_dev.subprocess.run", return_value=fake):
         assert manager.run_playbook(stream=False) is False
+
+
+_PLAYBOOK_OUTPUT = """\
+PLAY [Provision] ********************************************************
+
+TASK [Gathering Facts] **************************************************
+ok: [remote_vm]
+
+TASK [Install git] ******************************************************
+changed: [remote_vm]
+
+TASK [Clone private repo] ***********************************************
+fatal: [remote_vm]: FAILED! => {
+    "msg": "Authentication failed secret-token-value"
+}
+
+PLAY RECAP **************************************************************
+remote_vm                  : ok=2    changed=1    unreachable=0    failed=1
+"""
+
+
+def test_playbook_failure_excerpt_keeps_the_failed_task():
+    from cli.remote_dev import ansible_verbosity_args, playbook_failure_excerpt
+    from cli import log as rig_log
+
+    excerpt = playbook_failure_excerpt(_PLAYBOOK_OUTPUT)
+    assert "Clone private repo" in excerpt
+    assert "Authentication failed" in excerpt
+    assert "PLAY RECAP" in excerpt
+    assert "Gathering Facts" not in excerpt
+    assert "Install git" not in excerpt
+    assert playbook_failure_excerpt("") == ""
+    assert playbook_failure_excerpt("   \n") == ""
+    assert playbook_failure_excerpt("ERROR! syntax\n") == "ERROR! syntax\n"
+    errored = playbook_failure_excerpt(
+        "TASK [Lookup] *****************************************************\n"
+        "[ERROR]: the role 'missing' was not found\n"
+        "unreachable: [remote_vm]: UNREACHABLE!\n"
+    )
+    assert "the role 'missing'" in errored
+    assert "UNREACHABLE" in errored
+
+    recap_only = (
+        "TASK [Last step] ************************************************\n"
+        "ok: [remote_vm]\n\n"
+        "PLAY RECAP ******************************************************\n"
+        "remote_vm : ok=1 failed=1\n"
+    )
+    fallback = playbook_failure_excerpt(recap_only)
+    assert "Last step" in fallback
+    assert "PLAY RECAP" in fallback
+
+    rig_log.configure_logging()
+    assert ansible_verbosity_args() == []
+    rig_log.configure_logging(verbosity=1)
+    assert ansible_verbosity_args() == []
+    rig_log.configure_logging(verbosity=2)
+    assert ansible_verbosity_args() == ["-v"]
+    rig_log.configure_logging(verbosity=4)
+    assert ansible_verbosity_args() == ["-vvv"]
+    rig_log.configure_logging()
+
+
+def _fake_playbook_process(lines, returncode):
+    class FakeStdout:
+        def __iter__(self_inner):
+            yield from lines
+
+    class Proc:
+        stdout = FakeStdout()
+
+        def wait(self, timeout=None):
+            return returncode
+
+    return Proc()
+
+
+def test_default_playbook_log_is_lifecycle_until_a_task_fails(tmp_path, monkeypatch, capsys):
+    from cli import log as rig_log
+
+    rig_log.configure_logging()
+    cfg = ProjectConfig(str(tmp_path))
+    cfg.init(name="quiet", agent_type="opencode")
+    manager = AnsibleManager(cfg)
+    manager.configure(str(tmp_path))
+    manager.setup_inventory("1.2.3.4", "/key")
+    playbook = tmp_path / "provision.yml"
+    playbook.write_text("- hosts: all\n")
+    monkeypatch.setattr("cli.vault_keys.unlock_data_keys", lambda *a, **k: None)
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        "cli.remote_dev.subprocess.Popen",
+        lambda *a, **k: _fake_playbook_process(["ok: [remote_vm]\n"], 0),
+    )
+    assert manager._run_one_playbook(str(playbook), stream=True) is True
+    streamed = capsys.readouterr()
+    assert streamed.out == ""
+    assert "Playbook succeeded" in streamed.err
+    assert "ok: [remote_vm]" not in streamed.err
+
+    monkeypatch.setattr(
+        "cli.remote_dev.subprocess.Popen",
+        lambda *a, **k: _fake_playbook_process(_PLAYBOOK_OUTPUT.splitlines(keepends=True), 2),
+    )
+    manager.extra_vars = {"github_pat": "secret-token-value"}
+    assert manager._run_one_playbook(str(playbook), stream=True) is False
+    failed = capsys.readouterr()
+    assert failed.out == ""
+    assert "Gathering Facts" not in failed.err
+    assert "Clone private repo" in failed.err
+    assert "PLAY RECAP" in failed.err
+    assert "secret-token-value" not in failed.err
+    assert "***" in failed.err
+
+
+def test_verbose_playbook_streams_tasks_and_passes_ansible_verbosity(tmp_path, monkeypatch, capsys):
+    from cli import log as rig_log
+
+    cfg = ProjectConfig(str(tmp_path))
+    cfg.init(name="verbose", agent_type="opencode")
+    manager = AnsibleManager(cfg)
+    manager.configure(str(tmp_path))
+    manager.setup_inventory("1.2.3.4", "/key")
+    playbook = tmp_path / "provision.yml"
+    playbook.write_text("- hosts: all\n")
+    monkeypatch.setattr("cli.vault_keys.unlock_data_keys", lambda *a, **k: None)
+    captured = {}
+
+    def popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env") or {}
+        return _fake_playbook_process(["TASK [Install git]\n", "ok: [remote_vm]\n"], 0)
+
+    monkeypatch.setattr("cli.remote_dev.subprocess.Popen", popen)
+    rig_log.configure_logging(verbosity=3)
+    assert manager._run_one_playbook(str(playbook), stream=True) is True
+    streamed = capsys.readouterr()
+    assert "ok: [remote_vm]" in streamed.out
+    assert "-vv" in captured["cmd"]
+    search = captured["env"]["ANSIBLE_ROLES_PATH"].split(os.pathsep)
+    assert search[0].endswith(os.path.join(".rig", "local_roles"))
+    assert search[1].endswith(os.path.join(".rig", "galaxy_roles"))
+    rig_log.configure_logging()
 
 
 def test_cloud_provider_defaults_and_aliases():

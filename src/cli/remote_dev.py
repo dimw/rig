@@ -371,14 +371,68 @@ def project_editor_preference(project_dir: Optional[str] = None) -> Optional[str
     return None
 
 # Paths written under the project by Galaxy / create that should not be committed.
+# ``local_roles`` is the committed role directory and is intentionally absent.
 GITIGNORE_MARKER_BEGIN = "# >>> rig managed"
 GITIGNORE_MARKER_END = "# <<< rig managed"
 GITIGNORE_ENTRIES = (
     ".rig/collections/",
     ".rig/roles/",
+    ".rig/galaxy_roles/",
     ".rig/inventory.yml",
     ".rig/*.retry",
 )
+# Galaxy installs into ``galaxy_roles`` (and legacy ``roles``). ``local_roles``
+# is committed and searched first.
+LOCAL_ROLES_DIRNAME = "local_roles"
+GALAXY_ROLES_DIRNAME = "galaxy_roles"
+ROLES_DIRNAME = "roles"
+
+
+def roles_search_path(rig_dir: str) -> str:
+    """Ansible role search path: committed roles, then Galaxy installs."""
+    return os.pathsep.join(
+        os.path.join(rig_dir, name)
+        for name in (LOCAL_ROLES_DIRNAME, GALAXY_ROLES_DIRNAME, ROLES_DIRNAME)
+    )
+
+
+def ensure_local_roles_dir(rig_dir: str) -> bool:
+    """Create ``.rig/local_roles`` and a ``.gitkeep`` when that file is missing."""
+    path = os.path.join(rig_dir, LOCAL_ROLES_DIRNAME)
+    os.makedirs(path, exist_ok=True)
+    keep = os.path.join(path, ".gitkeep")
+    if os.path.exists(keep):
+        return False
+    with open(keep, "a", encoding="utf-8"):
+        pass
+    return True
+
+
+def relocate_installed_galaxy_roles(rig_dir: str) -> List[str]:
+    """Move Galaxy roles out of ``.rig/roles`` so they do not shadow local roles.
+
+    Ansible always looks in ``<playbook>/roles`` before ``ANSIBLE_ROLES_PATH``.
+    Playbooks live in ``.rig``, so a Galaxy role left in ``.rig/roles`` would
+    hide the same name under ``local_roles``. Only directories with Galaxy's
+    install marker are moved.
+    """
+    legacy = os.path.join(rig_dir, ROLES_DIRNAME)
+    dest_root = os.path.join(rig_dir, GALAXY_ROLES_DIRNAME)
+    if not os.path.isdir(legacy):
+        return []
+    os.makedirs(dest_root, exist_ok=True)
+    moved: List[str] = []
+    for name in sorted(os.listdir(legacy)):
+        src = os.path.join(legacy, name)
+        marker = os.path.join(src, "meta", ".galaxy_install_info")
+        if not os.path.isdir(src) or not os.path.isfile(marker):
+            continue
+        dest = os.path.join(dest_root, name)
+        if os.path.exists(dest):
+            continue
+        shutil.move(src, dest)
+        moved.append(name)
+    return moved
 
 
 def ensure_project_gitignore(project_dir: str) -> List[str]:
@@ -3470,7 +3524,9 @@ class ProjectConfig:
     REQUIREMENTS_YML = "requirements.yml"
     # Back-compat alias
     REQUIREMENTS_TXT = REQUIREMENTS_YML
-    ROLES_DIR = "roles"
+    ROLES_DIR = ROLES_DIRNAME
+    LOCAL_ROLES_DIR = LOCAL_ROLES_DIRNAME
+    GALAXY_ROLES_DIR = GALAXY_ROLES_DIRNAME
 
     def __init__(self, project_dir: Optional[str] = None):
         self.project_dir = project_dir or os.getcwd()
@@ -3919,6 +3975,8 @@ class ProjectConfig:
             requirements_path = os.path.join(self.rig_dir, self.REQUIREMENTS_YML)
             if not os.path.exists(requirements_path):
                 created.append(f"{self.RIG_DIR}/{self.REQUIREMENTS_YML}")
+            if ensure_local_roles_dir(self.rig_dir):
+                created.append(f"{self.RIG_DIR}/{self.LOCAL_ROLES_DIR}/.gitkeep")
 
             self._migrate_legacy_playbook_files()
             stage_paths = {
@@ -4769,6 +4827,70 @@ def interactive_env_init(
 # ANSIBLE INTEGRATION CLASS
 # =============================================================================
 
+_PLAYBOOK_SECTION_RE = re.compile(r"^(?:PLAY RECAP|PLAY|TASK)\b")
+_PLAYBOOK_FAILURE_RE = re.compile(
+    r"^(?:fatal:|failed:|unreachable:)|FAILED!|UNREACHABLE!"
+)
+
+
+def ansible_verbosity_args() -> List[str]:
+    """Ansible ``-v`` flags for the current rig verbosity.
+
+    ``-v`` streams the normal ansible task log. Each further ``v`` is passed
+    through (``-vv`` → ansible ``-v``, up to ansible ``-vvvvvv``).
+    """
+    extra = log.verbosity() - 1
+    if extra <= 0:
+        return []
+    return ["-" + ("v" * min(extra, 6))]
+
+
+def playbook_failure_excerpt(output: str) -> str:
+    """Keep the failed task blocks and the recap from an ansible run.
+
+    Successful tasks stay out of the default log. Output that has no task
+    markers is returned whole so an unrecognized failure is still visible.
+    """
+    if not output or not output.strip():
+        return ""
+    lines = output.splitlines(keepends=True)
+    sections: List[List[str]] = []
+    current: List[str] = []
+    for line in lines:
+        if _PLAYBOOK_SECTION_RE.match(line) and current:
+            sections.append(current)
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        sections.append(current)
+
+    chosen: List[List[str]] = []
+    saw_header = False
+    for section in sections:
+        head = section[0].lstrip()
+        if _PLAYBOOK_SECTION_RE.match(head):
+            saw_header = True
+        if head.startswith("PLAY RECAP"):
+            chosen.append(section)
+            continue
+        if any(
+            _PLAYBOOK_FAILURE_RE.search(part.lstrip())
+            or part.lstrip().startswith("[ERROR]")
+            or part.lstrip().startswith("ERROR!")
+            for part in section
+        ):
+            chosen.append(section)
+    if not chosen or not saw_header:
+        return output
+    # A recap with no recognized task still belongs to the last task.
+    if all(section[0].lstrip().startswith("PLAY RECAP") for section in chosen):
+        tasks = [section for section in sections if section[0].lstrip().startswith("TASK")]
+        if tasks:
+            chosen.insert(0, tasks[-1])
+    return "".join("".join(section) for section in chosen)
+
+
 class AnsibleManager:
     """Manages Ansible playbook execution for project bootstrap"""
 
@@ -4887,7 +5009,7 @@ class AnsibleManager:
             with open(self.inventory_path, 'w', encoding='utf-8') as handle:
                 yaml.dump(inventory, handle, Dumper=_VarsDumper, default_flow_style=False, sort_keys=False)
 
-            print(f"✓ Inventory created at {self.inventory_path}")
+            log.debug("Inventory created at %s", self.inventory_path)
             return True
         except Exception as e:
             print(f"Error creating inventory: {e}")
@@ -4942,56 +5064,27 @@ class AnsibleManager:
                 except OSError:
                     pass
 
-            print(f"✓ Requirements created at {requirements_path}")
+            log.debug("Requirements created at %s", requirements_path)
             return True
         except Exception as e:
             print(f"Error creating requirements: {e}")
             return False
 
     def setup_roles(self) -> bool:
-        """Set up roles directory with custom roles"""
+        """Ensure the committed role directory and the Galaxy install directories."""
         try:
             if self.project_config is None:
                 print("Error: project_config is not set")
                 return False
-            roles_dir = os.path.join(self.project_config.rig_dir, 'roles')
-
-            if not os.path.exists(roles_dir):
-                os.makedirs(roles_dir)
-
-            # Create role directory structure if empty
-            if not os.listdir(roles_dir):
-                # Create a default role structure
-                default_role = os.path.join(roles_dir, 'default_role')
-                os.makedirs(os.path.join(default_role, 'tasks'))
-                os.makedirs(os.path.join(default_role, 'handlers'))
-                os.makedirs(os.path.join(default_role, 'templates'))
-                os.makedirs(os.path.join(default_role, 'files'))
-
-                # Create tasks/main.yml
-                tasks_path = os.path.join(default_role, 'tasks', 'main.yml')
-                with open(tasks_path, 'w') as f:
-                    f.write("""---
-- name: Configure remote development environment
-  hosts: remote_vm
-  gather_facts: yes
-  tasks:
-    - name: Update apt cache
-      apt:
-        update_cache: yes
-        cache_valid_time: 3600
-
-    - name: Install development tools
-      apt:
-        name:
-          - build-essential
-          - git
-          - curl
-          - vim
-        state: present
-""")
-
-            log.debug("Roles directory set up at %s", roles_dir)
+            rig_dir = self.project_config.rig_dir
+            for name in (LOCAL_ROLES_DIRNAME, GALAXY_ROLES_DIRNAME, ROLES_DIRNAME):
+                os.makedirs(os.path.join(rig_dir, name), exist_ok=True)
+            ensure_local_roles_dir(rig_dir)
+            relocate_installed_galaxy_roles(rig_dir)
+            log.debug(
+                "Roles search path: %s",
+                roles_search_path(rig_dir),
+            )
             return True
         except Exception as e:
             log.error("Error setting up roles: %s", e)
@@ -5036,8 +5129,8 @@ class AnsibleManager:
                 if not self.project_config.write_materialize_playbook(force=False):
                     return False
 
-            print(f"✓ Provision playbook: {self.playbook_path}")
-            print(f"✓ Materialize playbook: {self.materialize_playbook_path}")
+            log.debug("Provision playbook: %s", self.playbook_path)
+            log.debug("Materialize playbook: %s", self.materialize_playbook_path)
             return True
         except Exception as e:
             print(f"Error creating playbook: {e}")
@@ -5057,11 +5150,13 @@ class AnsibleManager:
                 print(f"Warning: Requirements file not found: {requirements_path}")
                 return False
 
-            roles_path = os.path.join(self.project_config.rig_dir, 'roles')
-            collections_path = os.path.join(self.project_config.rig_dir, 'collections')
+            rig_dir = self.project_config.rig_dir
+            roles_path = os.path.join(rig_dir, GALAXY_ROLES_DIRNAME)
+            collections_path = os.path.join(rig_dir, 'collections')
             os.makedirs(roles_path, exist_ok=True)
             os.makedirs(collections_path, exist_ok=True)
-            self.ansible_env['ANSIBLE_ROLES_PATH'] = roles_path
+            relocate_installed_galaxy_roles(rig_dir)
+            self.ansible_env['ANSIBLE_ROLES_PATH'] = roles_search_path(rig_dir)
             self.ansible_env['ANSIBLE_COLLECTIONS_PATH'] = collections_path
 
             # Install collections (and roles if listed) from the requirements file.
@@ -5239,10 +5334,11 @@ class AnsibleManager:
         ):
             cmd.extend(["--vault-password", self.vault_password])
 
-        roles_path = os.path.join(self.project_config.rig_dir, 'roles')
-        collections_path = os.path.join(self.project_config.rig_dir, 'collections')
-        self.ansible_env['ANSIBLE_ROLES_PATH'] = roles_path
+        rig_dir = self.project_config.rig_dir
+        collections_path = os.path.join(rig_dir, 'collections')
+        self.ansible_env['ANSIBLE_ROLES_PATH'] = roles_search_path(rig_dir)
         self.ansible_env['ANSIBLE_COLLECTIONS_PATH'] = collections_path
+        cmd.extend(ansible_verbosity_args())
 
         log.debug("Inventory: %s", self.inventory_path)
         if os.path.exists(vars_path):
@@ -5257,7 +5353,13 @@ class AnsibleManager:
                 or "unable to parse" in lowered and "inventory" in lowered
             )
 
+        def _failure_detail(text: str) -> str:
+            excerpt = self._redact_secrets(playbook_failure_excerpt(text)).strip()
+            return f"\n{excerpt}" if excerpt else ""
+
         if stream:
+            # Default runs stay on lifecycle lines. -v streams each task.
+            show_tasks = log.verbosity() >= 1
             process = subprocess.Popen(
                 cmd,
                 env=self.ansible_env,
@@ -5269,18 +5371,24 @@ class AnsibleManager:
             collected: List[str] = []
             assert process.stdout is not None
             for line in process.stdout:
-                # Live ansible-playbook output stays on stdout.
-                print(line, end="")
+                if show_tasks:
+                    print(line, end="")
                 collected.append(line)
             returncode = process.wait(timeout=1800)
             output = "".join(collected)
             if returncode != 0:
-                log.error("Playbook failed (%s): %s", returncode, playbook_path)
+                log.error(
+                    "Playbook failed (%s): %s%s",
+                    returncode,
+                    playbook_path,
+                    _failure_detail(output),
+                )
                 return False
             if _output_indicates_no_hosts(output):
                 log.error(
-                    "Playbook matched no hosts (inventory/vars issue): %s",
+                    "Playbook matched no hosts (inventory/vars issue): %s%s",
                     playbook_path,
+                    _failure_detail(output),
                 )
                 return False
             log.info("Playbook succeeded: %s", playbook_path)
@@ -5290,15 +5398,18 @@ class AnsibleManager:
         combined = f"{result.stdout or ''}\n{result.stderr or ''}"
         if result.returncode == 0 and not _output_indicates_no_hosts(combined):
             log.info("Playbook succeeded: %s", playbook_path)
+            if log.verbosity() >= 1 and result.stdout:
+                log.debug("STDOUT:\n%s", self._redact_secrets(result.stdout))
             return True
 
-        log.error("Playbook failed (return code %s): %s", result.returncode, playbook_path)
+        log.error(
+            "Playbook failed (return code %s): %s%s",
+            result.returncode,
+            playbook_path,
+            _failure_detail(combined),
+        )
         if _output_indicates_no_hosts(combined):
             log.error("No hosts matched — check inventory.yml parses and lists remote_vm")
-        if result.stderr:
-            log.debug("STDERR:\n%s", self._redact_secrets(result.stderr))
-        if result.stdout:
-            log.debug("STDOUT:\n%s", self._redact_secrets(result.stdout))
         return False
 
     def setup_bootstrap(self, vm_ip: str, ssh_key_path: str) -> bool:

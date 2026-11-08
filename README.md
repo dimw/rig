@@ -56,7 +56,7 @@ Chosen at `rig init` (`editor.enabled` in `rig.yml`, same multi-select as git pr
 
 ```text
 rig.yml                 # workspace manifest (vm, agent, playbooks, repos)
-.gitignore              # adds .rig/collections, roles, inventory (via init)
+.gitignore              # adds .rig/collections, roles, galaxy_roles, inventory (via init)
 .rig/
   provision.yml         # managed; create base environment (cached)
   configure.yml         # user; image/service customizations (cached)
@@ -67,11 +67,14 @@ rig.yml                 # workspace manifest (vm, agent, playbooks, repos)
   vars.yml              # Shared Ansible vars (vaulted with shared data key)
   vars.<identity>.yml   # Personal secrets + master-key wraps (committed)
   requirements.yml      # Galaxy collections/roles
+  local_roles/          # committed Ansible roles (searched first)
   AGENTS.md             # agent instructions
   .opencode/ | .claude/ | .cursor/  # agent config + MCP
   inventory.yml         # generated at create/apply (gitignored)
-  collections/ roles/   # Galaxy installs (gitignored)
+  collections/ galaxy_roles/ roles/   # Galaxy installs (gitignored)
 ```
+
+Put a committed role at `.rig/local_roles/<name>/` (`tasks/main.yml` and the usual role layout). `rig init` creates the directory. Galaxy roles install into `.rig/galaxy_roles/` and stay gitignored, as do any older installs still under `.rig/roles/`. Ansible checks `.rig/roles/` before the configured path, so a Galaxy install found there is moved to `galaxy_roles` and `local_roles` is searched first.
 
 `rig.yml` defaults (edit to configure):
 
@@ -179,7 +182,7 @@ Override with `--force-playbooks` / `--force-system` (force provision+configure)
 
 ## CLI
 
-Global: `-v` debug · `-q` warnings/errors only · `--version`
+Global: `-v` playbook tasks and debug · `-vv`/`-vvv`/`-vvvv` ansible verbosity · `-q` warnings/errors only · `--version`. A failed task is shown without `-v`.
 
 | Command | Args | Notes |
 | --- | --- | --- |
