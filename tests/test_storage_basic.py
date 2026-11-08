@@ -519,6 +519,29 @@ class TestStorageErrorHandling:
             mock_s3.download_file.side_effect = not_found
             assert StorageManager().download_file(test_bucket_name, "k", out) is False
 
+    def test_list_objects_retries_missing_bucket(
+        self, hetzner_token, s3_credentials, test_bucket_name
+    ):
+        from cli.storage import StorageManager
+        from botocore.exceptions import ClientError
+
+        missing = ClientError(
+            error_response={
+                "Error": {"Code": "NoSuchBucket", "Message": "gone"},
+                "ResponseMetadata": {"HTTPStatusCode": 404},
+            },
+            operation_name="ListObjectsV2",
+        )
+        with patch("boto3.client") as mock_boto, patch("cli.storage.time.sleep"):
+            mock_s3 = MagicMock()
+            mock_boto.return_value = mock_s3
+            mock_s3.list_objects_v2.side_effect = [
+                missing,
+                {"Contents": [{"Key": "lifecycle.txt"}]},
+            ]
+            assert StorageManager().list_objects(test_bucket_name) == ["lifecycle.txt"]
+            assert mock_s3.list_objects_v2.call_count == 2
+
     def test_list_objects_and_delete_errors(
         self, hetzner_token, s3_credentials, test_bucket_name
     ):

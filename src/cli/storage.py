@@ -243,18 +243,38 @@ class StorageManager:
         return False
 
     def list_objects(self, bucket_name: str, prefix: str = "") -> list:
-        """List objects in a bucket"""
-        try:
-            s3_client = self._get_s3_client()
-            response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
-            objects = []
-            if 'Contents' in response:
-                objects = [obj['Key'] for obj in response['Contents']]
-            log.debug("Storage objects in %r (prefix %r): %s", bucket_name, prefix, objects)
-            return objects
-        except ClientError as e:
-            log.warning("Could not list storage objects: %s", e)
-            return []
+        """List objects in a bucket.
+
+        Hetzner Object Storage can return NoSuchBucket for a short window
+        after a successful upload, so that response is retried.
+        """
+        s3_client = self._get_s3_client()
+        deadline = time.time() + 30.0
+        delay = 0.2
+        last_error: Optional[BaseException] = None
+        while time.time() < deadline:
+            try:
+                response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+                objects = []
+                if 'Contents' in response:
+                    objects = [obj['Key'] for obj in response['Contents']]
+                log.debug(
+                    "Storage objects in %r (prefix %r): %s",
+                    bucket_name,
+                    prefix,
+                    objects,
+                )
+                return objects
+            except ClientError as e:
+                last_error = e
+                if self._is_not_found(e):
+                    time.sleep(delay)
+                    delay = min(delay * 1.5, 2.0)
+                    continue
+                log.warning("Could not list storage objects: %s", e)
+                return []
+        log.warning("Could not list storage objects: %s", last_error)
+        return []
 
     def delete_object(self, bucket_name: str, object_name: str) -> bool:
         """Delete an object from storage"""
