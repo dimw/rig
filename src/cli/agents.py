@@ -541,17 +541,17 @@ def prompt_default_agent(
     if not answer:
         return preferred
     if answer.isdigit():
-        agent = by_number.get(answer)
-        if not agent:
+        numbered = by_number.get(answer)
+        if not numbered:
             raise ValueError(
                 f"Default agent number {answer} is not one of the selected agents "
                 f"({', '.join(agents)})"
             )
-        return agent
-    agent = normalize_agent_type(answer)
-    if agent not in agents:
+        return numbered
+    chosen = normalize_agent_type(answer)
+    if chosen not in agents:
         raise ValueError(
-            f"Default agent {agent!r} was not selected. "
+            f"Default agent {chosen!r} was not selected. "
             f"Choose one of: {', '.join(agents)}"
         )
-    return agent
+    return chosen
