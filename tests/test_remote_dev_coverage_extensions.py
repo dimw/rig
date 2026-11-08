@@ -1121,8 +1121,8 @@ class TestWorkspaceAndInteractive:
         ), patch("cli.config.ensure_credentials"), patch(
             "cli.vault_keys.bootstrap_identity_keys"
         ), patch("cli.vault_keys.read_wrap_fields", return_value={}), patch(
-            "cli.agents.prompt_coding_agent",
-            return_value="opencode",
+            "cli.agents.prompt_coding_agents",
+            return_value=["opencode"],
         ), patch("cli.remote_dev.prompt_editor", return_value="code"), patch(
             "cli.encrypt.collect_repo_pats",
             return_value=({}, {}),
@@ -1907,7 +1907,10 @@ class TestInteractiveEnvInitBranches:
             MagicMock(return_value=False),
         )
         monkeypatch.setattr("cli.agents.sync_opencode_config", MagicMock(return_value=False))
-        monkeypatch.setattr("cli.agents.prompt_coding_agent", MagicMock(return_value="opencode"))
+        monkeypatch.setattr(
+            "cli.agents.prompt_coding_agents",
+            MagicMock(return_value=["opencode"]),
+        )
         monkeypatch.setattr("cli.remote_dev.prompt_editor", MagicMock(return_value="code"))
         for key, val in extra.items():
             monkeypatch.setattr(key, val)
@@ -1989,7 +1992,7 @@ class TestInteractiveEnvInitBranches:
             monkeypatch,
         )
         monkeypatch.setattr(
-            "cli.agents.prompt_coding_agent",
+            "cli.agents.prompt_coding_agents",
             MagicMock(side_effect=ValueError("bad agent")),
         )
         inputs = iter(["all", "wspace"])

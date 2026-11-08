@@ -206,25 +206,61 @@ def _cmd_attach(args: argparse.Namespace) -> int:
 
         project = ProjectConfig(os.getcwd())
         project.load()
-        agent_type = (
-            (project.config.get("agent") or {}).get("type")
-            or project.get_vars("coding_agent_type")
-            or "opencode"
-        )
+        from cli.remote_dev import configured_agents
+        from cli.agents import normalize_agent_type
+
+        configured, default_agent = configured_agents(project)
+        requested = getattr(args, "agent", None)
+        if requested:
+            try:
+                agent_type = normalize_agent_type(requested)
+            except ValueError as exc:
+                log.error("%s", exc)
+                return 1
+            if agent_type not in configured:
+                log.error(
+                    "Coding agent '%s' is not enabled for this workspace "
+                    "(enabled: %s)",
+                    agent_type,
+                    ", ".join(configured),
+                )
+                return 1
+        else:
+            agent_type = default_agent
 
         # Bare ``rig attach`` reopens the last remembered session when present.
+        # With several agents installed, resume the one that owns that session
+        # unless --agent picked a different one.
         if not agent_args_request_session(agent_args):
             stored = read_last_session(env.name)
             if stored:
                 session_id, stored_agent = stored
                 resume_agent = stored_agent or agent_type
-                injected = resume_args_for_agent(resume_agent, session_id)
-                agent_args = injected + list(agent_args)
-                log.info(
-                    "Resuming last %s session %s",
-                    resume_agent,
-                    session_id,
-                )
+                if (
+                    not requested
+                    and stored_agent
+                    and stored_agent in configured
+                ):
+                    agent_type = stored_agent
+                    resume_agent = stored_agent
+                if requested and stored_agent and stored_agent != agent_type:
+                    resume_agent = None
+                elif stored_agent and stored_agent != agent_type:
+                    resume_agent = None
+                if resume_agent:
+                    injected = resume_args_for_agent(resume_agent, session_id)
+                    agent_args = injected + list(agent_args)
+                    log.info(
+                        "Resuming last %s session %s",
+                        resume_agent,
+                        session_id,
+                    )
+        if len(configured) > 1:
+            log.info(
+                "Workspace coding agents: %s (attaching to %s)",
+                ", ".join(configured),
+                agent_type,
+            )
 
         env.ensure_firewall_access(project_dir=os.getcwd())
         remember_last_env(env.name)
@@ -868,6 +904,14 @@ def main(argv=None):
         const="",
         metavar="ID",
         help="Resume a Claude Code / Cursor session (forwards --resume [ID])",
+    )
+    attach_parser.add_argument(
+        "--agent",
+        dest="agent",
+        help=(
+            "Coding agent to open when several are configured "
+            "(opencode, claude, or cursor). Defaults to agent.type"
+        ),
     )
     attach_parser.add_argument(
         "agent_args",

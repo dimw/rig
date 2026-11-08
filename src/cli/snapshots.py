@@ -27,6 +27,7 @@ RIG_AGENT_LABEL_KEY = "rig_agent"
 # Values that change what system.yml installs (agent CLIs, gh/glab, code-server).
 SYSTEM_SNAPSHOT_VAR_KEYS: Tuple[str, ...] = (
     "coding_agent_type",
+    "coding_agent_types",
     "git_providers",
     "code_server_port",
     "code_server_user",
@@ -71,10 +72,14 @@ def _project_merged_vars(project) -> Dict[str, Any]:
     cfg = dict(getattr(project, "config", None) or {})
     vars_cfg = dict(getattr(project, "vars_config", None) or {})
     merged = {**vars_cfg, **{k: v for k, v in cfg.items() if k not in ("playbooks",)}}
-    # Prefer agent.type over coding_agent_type when both exist.
+    # Prefer agent.type / agent.types over the vars copies when both exist.
     agent = cfg.get("agent") or {}
-    if isinstance(agent, dict) and agent.get("type"):
+    if isinstance(agent, dict) and agent.get("type") and not isinstance(
+        agent.get("type"), (list, tuple)
+    ):
         merged["coding_agent_type"] = agent["type"]
+    if isinstance(agent, dict) and agent.get("types"):
+        merged["coding_agent_types"] = list(agent["types"])
     if "git_providers" not in merged and cfg.get("git_providers"):
         merged["git_providers"] = cfg["git_providers"]
     return merged
@@ -92,7 +97,7 @@ def extract_snapshot_var_map(
             continue
         value = merged[key]
         # Stabilize list order for providers / similar bags of strings.
-        if key == "git_providers" and isinstance(value, list):
+        if key in ("git_providers", "coding_agent_types") and isinstance(value, list):
             value = sorted({str(p).strip().lower() for p in value if str(p).strip()})
         out[key] = value
     return out
@@ -101,9 +106,14 @@ def extract_snapshot_var_map(
 def system_hash_inputs_from_project(project) -> Dict[str, Any]:
     """Backward-compatible alias: system var map (+ agent for labels)."""
     var_map = extract_snapshot_var_map(project, SYSTEM_SNAPSHOT_VAR_KEYS)
+    types = var_map.get("coding_agent_types")
+    if isinstance(types, list) and len(types) > 1:
+        agent_label = "+".join(str(item) for item in types)
+    else:
+        agent_label = str(var_map.get("coding_agent_type") or "opencode")
     return {
         "var_map": var_map,
-        "agent_type": str(var_map.get("coding_agent_type") or "opencode"),
+        "agent_type": agent_label,
     }
 
 

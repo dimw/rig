@@ -30,6 +30,24 @@ def test_system_snapshot_name_uses_version_and_hash():
     )
 
 
+def test_system_content_hash_changes_when_agent_set_changes():
+    one = system_content_hash(
+        var_map={
+            "coding_agent_type": "opencode",
+            "coding_agent_types": ["opencode"],
+        },
+        playbook_body="playbook-a",
+    )
+    several = system_content_hash(
+        var_map={
+            "coding_agent_type": "opencode",
+            "coding_agent_types": ["claude", "opencode"],
+        },
+        playbook_body="playbook-a",
+    )
+    assert one != several
+
+
 def test_system_content_hash_uses_var_map_not_editor():
     base = system_content_hash(
         var_map={
