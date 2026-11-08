@@ -8,11 +8,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from cli.main import main
 from cli.remote_dev import RemoteDevEnvironment
+from cli.remote_dev import ProjectConfig
 from cli.snapshots import (
     filter_snapshots,
     find_unused_snapshots,
     resolve_boot_snapshot,
     system_content_hash,
+    system_hash_inputs_from_project,
     system_snapshot_name,
     workspace_content_hash,
     workspace_snapshot_name,
@@ -28,6 +30,35 @@ def test_system_snapshot_name_uses_version_and_hash():
     assert system_snapshot_name("1.2.3+dirty", content_hash="abcd1234ef00") == (
         "rig-1.2.3-dirty-abcd1234ef00"
     )
+
+
+def test_system_content_hash_changes_when_agent_set_changes():
+    one = system_content_hash(
+        var_map={
+            "coding_agent_type": "opencode",
+            "coding_agent_types": ["opencode"],
+        },
+        playbook_body="playbook-a",
+    )
+    several = system_content_hash(
+        var_map={
+            "coding_agent_type": "opencode",
+            "coding_agent_types": ["claude", "opencode"],
+        },
+        playbook_body="playbook-a",
+    )
+    assert one != several
+
+
+def test_system_hash_inputs_label_joins_multiple_agents(tmp_path):
+    cfg = ProjectConfig(str(tmp_path))
+    assert cfg.init(
+        name="ws",
+        agent_type="claude",
+        agent_types=["opencode", "claude"],
+    )
+    inputs = system_hash_inputs_from_project(cfg)
+    assert inputs["agent_type"] == "claude+opencode"
 
 
 def test_system_content_hash_uses_var_map_not_editor():

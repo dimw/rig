@@ -31,6 +31,9 @@ def _hetzner_env(monkeypatch, tmp_path):
     monkeypatch.setenv("S3_ENDPOINT_URL", "https://fsn1.your-objectstorage.com")
     monkeypatch.delenv("RIG_GITHUB_PAT", raising=False)
     monkeypatch.delenv("RIG_CODING_AGENT_API_KEY", raising=False)
+    monkeypatch.delenv("RIG_OPENCODE_API_KEY", raising=False)
+    monkeypatch.delenv("RIG_ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("RIG_CURSOR_API_KEY", raising=False)
     monkeypatch.delenv("RIG_IDENTITY", raising=False)
     # Isolate ~/.rig/config identity writes (tmp data keys: tests/conftest.py).
     monkeypatch.setenv("RIG_CONFIG", str(tmp_path / "home-rig-config"))
@@ -379,10 +382,85 @@ def test_interactive_init_scaffolds_cursor_agent_files(tmp_path):
     assert (rig / ".rig" / ".cursor" / "mcp.json").is_file()
     system = (rig / ".rig" / "provision.yml").read_text()
     assert "Install Cursor CLI" in system
-    assert "coding_agent_type == \"cursor\"" in system
+    assert "'cursor' in _rig_agent_types" in system
     authnz = (rig / ".rig" / "authorize.yml").read_text()
     assert "CURSOR_API_KEY" in authnz
     assert "CURSOR_API_KEY" not in system
+
+
+def test_interactive_init_selects_multiple_agents(tmp_path):
+    root = tmp_path / "mystack"
+    rig = root / "rig"
+    _git_init(rig, "https://github.com/mystack-cloud/rig.git")
+    data_key = tmp_path / "data-key"
+    data_key.write_text("vault-pass\n")
+
+    # projects, name, agents, default attach agent, editor
+    answers = _answers("all", "rig", "opencode,claude", "claude", "code")
+    assert interactive_env_init(
+        str(rig),
+        input_fn=lambda _prompt: next(answers),
+        secret_fn=_secrets(),
+        config_path=str(tmp_path / "rig-config"),
+        data_key_path=str(data_key),
+    )
+
+    manifest = yaml.safe_load((rig / "rig.yml").read_text())
+    assert manifest["agent"]["type"] == "claude"
+    assert manifest["agent"]["types"] == ["opencode", "claude"]
+    assert manifest["agent"]["credentials_var"] == "claude_api_key"
+    assert manifest["agent"]["credentials"] == {
+        "opencode": "opencode_api_key",
+        "claude": "claude_api_key",
+    }
+    vars_data = yaml.load((rig / ".rig" / "vars.yml").read_text(), Loader=_VarsLoader)
+    assert vars_data["coding_agent_type"] == "claude"
+    assert vars_data["coding_agent_types"] == ["opencode", "claude"]
+    assert (rig / ".rig" / ".opencode" / "opencode.json").is_file()
+    assert (rig / ".rig" / ".claude" / "settings.json").is_file()
+    system = (rig / ".rig" / "provision.yml").read_text()
+    assert "'opencode' in _rig_agent_types" in system
+    assert "'claude' in _rig_agent_types" in system
+    authnz = (rig / ".rig" / "authorize.yml").read_text()
+    assert "opencode_api_key" in authnz
+    assert "claude_api_key" in authnz
+
+
+def test_interactive_init_stores_distinct_agent_api_keys(tmp_path):
+    root = tmp_path / "mystack"
+    rig = root / "rig"
+    _git_init(rig, "https://github.com/mystack-cloud/rig.git")
+    data_key = tmp_path / "data-key"
+    data_key.write_text("vault-pass\n")
+
+    # projects, name, agents 1+3, default (Enter), editor, personal storage
+    answers = _answers("all", "rig", "1,3", "", "code", "y")
+    secrets = iter([_MASTER, _MASTER, "", "oc-key", "cursor-key"])
+
+    from unittest.mock import patch
+
+    def _fake_encrypt(plaintext, name, vault_password_file, vault_id=None):
+        return (
+            f"{name}: !vault |\n"
+            "          $ANSIBLE_VAULT;1.1;AES256\n"
+            f"          {plaintext}\n"
+        )
+
+    with patch("cli.encrypt.encrypt_named_value", side_effect=_fake_encrypt):
+        assert interactive_env_init(
+            str(rig),
+            input_fn=lambda _prompt: next(answers),
+            secret_fn=lambda _prompt: next(secrets),
+            config_path=str(tmp_path / "rig-config"),
+            data_key_path=str(data_key),
+        )
+
+    personal = _personal_vars_text(rig)
+    assert "opencode_api_key: !vault |" in personal
+    assert "cursor_api_key: !vault |" in personal
+    assert "oc-key" in personal
+    assert "cursor-key" in personal
+    assert "coding_agent_api_key:" not in personal
 
 
 def test_interactive_init_converts_ssh_remote_to_https_and_stores_pat(tmp_path):

@@ -27,15 +27,15 @@ Run `rig` from your machine, CI/CD, or a control plane: it provisions cloud VMs 
 
 ## Coding agents
 
-Chosen at `rig init` (`agent.type` in `rig.yml`). `rig attach` opens an SSH TTY into the agent on `/workspace`.
+Chosen at `rig init` (`agent.types` in `rig.yml`, same multi-select as git projects: numbers, names, or `all`). Every selected agent is installed and configured on the VM. When more than one is selected, init asks which is the default for `rig attach` (`agent.type`). Pass `--agent` to open another one.
 
-| Agent | `agent.type` | Notes |
+| Agent | `agent.type` | API key |
 | --- | --- | --- |
-| [OpenCode](https://opencode.ai) | `opencode` (default) | Free Zen models without an API key; keyed config uses the paid provider path |
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `claude` | Needs `coding_agent_api_key` (Anthropic) |
-| [Cursor CLI](https://cursor.com/docs/cli/overview) | `cursor` | Installs `agent` on the VM; needs `coding_agent_api_key` (`CURSOR_API_KEY`) |
+| [OpenCode](https://opencode.ai) | `opencode` (default) | Optional. One agent: `coding_agent_api_key`. Several agents: `opencode_api_key`. Enter skips and uses free Zen models |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `claude` | One agent: `coding_agent_api_key` (Anthropic). Several agents: `claude_api_key` |
+| [Cursor CLI](https://cursor.com/docs/cli/overview) | `cursor` | One agent: `coding_agent_api_key` (`CURSOR_API_KEY`). Several agents: `cursor_api_key` |
 
-Agent config scaffolds under `.rig/.opencode/`, `.rig/.claude/`, or `.rig/.cursor/` (plus `AGENTS.md`). Independent of `editor` (local IDE for `rig dev`).
+Each selected agent is asked for its own key. Scaffolds land under `.rig/.opencode/`, `.rig/.claude/`, and `.rig/.cursor/` (plus shared `AGENTS.md`). Independent of `editor` (local IDE for `rig dev`).
 
 ## IDEs
 
@@ -83,7 +83,8 @@ firewall:
   allowed_ips: []     # static allow-list; also merged into dynamic modes
   ports: []           # extra inbound ports, e.g. [8080, "3000-3001", {port: 53, protocol: udp}]
 agent:
-  type: opencode          # or claude | cursor
+  type: opencode          # default for `rig attach`; or claude | cursor
+  # types: [opencode, claude, cursor]  # install every listed agent
 editor: code                  # code | code-insiders | cursor | codium
 playbooks:
   provision: .rig/provision.yml
@@ -134,10 +135,10 @@ destroy playbooks:
 
 | Command | What happens |
 | --- | --- |
-| **init** | Scaffold `rig.yml` + `.rig/`. Collect Hetzner creds, repo PATs, agent choice/key. |
+| **init** | Scaffold `rig.yml` + `.rig/`. Collect Hetzner creds, repo PATs, agent choices and a key per agent. |
 | **create** | Boot VM (base/system snapshot). Run provision → configure → authorize → materialize. Snapshot after **configure** only. |
 | **apply** | Default: authorize → materialize. Flags: `--provision` / `--configure` / `--authorize` / `--materialize`. |
-| **attach** | SSH TTY into `opencode` / `claude` / Cursor `agent` on `/workspace`. |
+| **attach** | SSH TTY into `opencode` / `claude` / Cursor `agent` on `/workspace`. `--agent` picks among installed agents. |
 | **dev** | Open VS Code/Cursor via Remote-SSH on `/workspace` (or `--browser` for code-server). |
 | **destroy** | Run finalize → destroy playbooks, then delete VM / firewall / SSH key. |
 
@@ -154,7 +155,7 @@ After you leave an agent TTY, rig captures the printed session / resume id (when
 | `rig-{version}-{hash}` | provision + configure (`authorize` + `materialize` still run) |
 | base image | nothing |
 
-**System hash** = var map (`coding_agent_type`, `git_providers`, `code_server_*`, `workspace_root`) + `provision.yml` + `configure.yml`. Secrets and `authorize.yml` / `materialize.yml` are not included.
+**System hash** = var map (`coding_agent_type`, `coding_agent_types`, `git_providers`, `code_server_*`, `workspace_root`) + `provision.yml` + `configure.yml`. Secrets and `authorize.yml` / `materialize.yml` are not included.
 
 Override with `--force-playbooks` / `--force-system` (force provision+configure) / `--force-workspace` (force materialize).
 
@@ -179,7 +180,7 @@ Global: `-v` debug · `-q` warnings/errors only · `--version`
 | `init` | | Interactive scaffold |
 | `create` | `[--name]` `[--type]` `[--availability-zone]` `[--image]` `[--no-attach]` `[--force-playbooks\|--force-system\|--force-workspace]` | VM defaults from `rig.yml`; flags override. `--region` aliases `--availability-zone`. |
 | `apply` | `[name]` `[--provision\|--configure\|--authorize\|--materialize]` | Default: authorize then materialize |
-| `attach` | `[name]` `[-c\|--continue]` `[-s\|--session ID]` `[--resume [ID]]` `[-- …agent args]` | Reopens last remembered session by default; flags override |
+| `attach` | `[name]` `[-c\|--continue]` `[-s\|--session ID]` `[--resume [ID]]` `[--agent opencode\|claude\|cursor]` `[-- …agent args]` | Reopens last remembered session by default; `--agent` picks which installed agent |
 | `dev` | `[name]` `[--path /workspace]` `[--browser]` `[--editor code\|cursor\|…]` | Remote-SSH by default; `--editor` overrides `editor` in `rig.yml` |
 | `list` | | Lists envs, or `No remote environments` |
 | `destroy` | `[name …]` | Runs finalize then destroy playbooks first; multi-name OK |
@@ -203,7 +204,8 @@ Playbooks load `.rig/vars.yml` then `.rig/vars.{identity}.yml` (personal wins), 
 | `rig_vm_image` | Boot image or snapshot id |
 | `rig_vm_ip` | Public IPv4 |
 | `rig_vm_id` | Hetzner server id |
-| `rig_agent_type` | `opencode` or `claude` |
+| `rig_agent_type` | Default attach agent (`opencode`, `claude`, or `cursor`) |
+| `rig_agent_types` | Agents installed on the VM |
 | `rig_workspace_root` | `/workspace` |
 | `rig_version` | Installed `rig` package version |
 | `rig_boot_source` | `base` \| `system` \| `workspace` |
@@ -214,7 +216,7 @@ Playbooks load `.rig/vars.yml` then `.rig/vars.{identity}.yml` (personal wins), 
 | `rig_repos` | `[{name, url, path}, …]` (no secrets) |
 | `rig_git_providers` | e.g. `github`, `gitlab` |
 
-Also available from vars files (defaults): `workspace_root`, `coding_agent_type`, `git.clone_repos`. On `rig init`, git PATs and the coding agent API key default to **personal** storage in `vars.{identity}.yml` (you are asked to confirm); shared secrets such as `vscode_browser_password` live in `vars.yml`.
+Also available from vars files (defaults): `workspace_root`, `coding_agent_type`, `coding_agent_types`, `git.clone_repos`. On `rig init`, git PATs and each coding agent API key default to **personal** storage in `vars.{identity}.yml` (you are asked to confirm once); shared secrets such as `vscode_browser_password` live in `vars.yml`.
 
 `vscode_browser_password` is auto-generated (vaulted) for code-server browser login (`rig dev --browser`). Reveal with `rig vars decrypt vscode_browser_password` (also printed when opening browser mode).
 
@@ -230,7 +232,7 @@ Also available from vars files (defaults): `workspace_root`, `coding_agent_type`
 
 `RIG_IDENTITY` overrides the configured identity. Teammates joining an existing workspace paste the shared data key once (`rig vars export-shared-key` from an unlocked machine).
 
-OpenCode without `coding_agent_api_key` uses free Zen models. With a key, config switches to the paid provider path.
+OpenCode without an API key uses free Zen models. With a key, config switches to the paid provider path. When several agents are selected, keys are `opencode_api_key`, `claude_api_key`, and `cursor_api_key` (`RIG_OPENCODE_API_KEY`, `RIG_ANTHROPIC_API_KEY`, `RIG_CURSOR_API_KEY`). A single agent still uses `coding_agent_api_key` (`RIG_CODING_AGENT_API_KEY`).
 
 ## Tests
 

@@ -170,6 +170,19 @@ def ensure_project_gitignore(project_dir: str) -> List[str]:
     return missing
 
 
+def configured_agents(project) -> Tuple[List[str], str]:
+    """Installed coding agents and the default attach target for a project."""
+    from cli.agents import resolve_configured_agents
+
+    if project is None:
+        return resolve_configured_agents({})
+    return resolve_configured_agents(
+        (project.config or {}).get("agent") or {},
+        coding_agent_type=project.get_vars("coding_agent_type"),
+        coding_agent_types=project.get_vars("coding_agent_types"),
+    )
+
+
 def build_rig_ansible_vars(
     env: "RemoteDevEnvironment",
     project: Optional["ProjectConfig"] = None,
@@ -184,7 +197,6 @@ def build_rig_ansible_vars(
     """
     cfg = (project.config if project else None) or {}
     vm_cfg = cfg.get("vm") or {}
-    agent_cfg = cfg.get("agent") or {}
     repos = [
         {
             "name": repo.get("name"),
@@ -206,6 +218,7 @@ def build_rig_ansible_vars(
     workspace_name = cfg.get("name") or (env.name if env else "")
     ssh_key_name = (env.ssh_key_name if env else None) or ""
     ssh_key_path = f"/tmp/{ssh_key_name}" if ssh_key_name else ""
+    installed_agents, default_agent = configured_agents(project)
 
     vars_out: Dict[str, Any] = {
         "rig_env_name": env.name if env else "",
@@ -223,11 +236,8 @@ def build_rig_ansible_vars(
         ),
         "rig_vm_ip": (env.vm_ip if env else None) or "",
         "rig_vm_id": str(env.vm_id) if env and env.vm_id is not None else "",
-        "rig_agent_type": (
-            agent_cfg.get("type")
-            or (project.get_vars("coding_agent_type") if project else None)
-            or "opencode"
-        ),
+        "rig_agent_type": default_agent,
+        "rig_agent_types": list(installed_agents),
         "rig_workspace_root": REMOTE_WORKSPACE_ROOT,
         "rig_version": version,
         "rig_boot_source": (env.boot_source if env else None) or "base",
@@ -1379,17 +1389,13 @@ class RemoteDevEnvironment:
             log.error("SSH private key not found at %s", ssh_key_path)
             return False
 
-        agent_type = (
-            (project.config.get("agent") or {}).get("type")
-            or project.get_vars("coding_agent_type")
-            or "opencode"
-        )
+        installed_agents, _default_agent = configured_agents(project)
         log.info(
-            "Applying %s on %s as root@%s (agent=%s)",
+            "Applying %s on %s as root@%s (agents=%s)",
             "+".join(wanted),
             project_dir,
             self.vm_ip,
-            agent_type,
+            ",".join(installed_agents),
         )
 
         # Ensure legacy /root/<repo> clone destinations are under /workspace.
@@ -2105,11 +2111,7 @@ echo "Agent installation complete!"
         if not agent_type:
             project = ProjectConfig(os.path.abspath(project_dir or os.getcwd()))
             project.load()
-            agent_type = (
-                (project.config.get("agent") or {}).get("type")
-                or project.get_vars("coding_agent_type")
-                or "opencode"
-            )
+            _installed, agent_type = configured_agents(project)
 
         ssh_key_path = f"/tmp/{self.ssh_key_name}"
         remote_cmd = self.agent_remote_command(agent_type, extra_args=agent_args)
@@ -2408,15 +2410,12 @@ echo "Agent installation complete!"
         """Get information needed to connect to the remote agent"""
         project = ProjectConfig(os.getcwd())
         project.load()
-        agent_type = (
-            (project.config.get("agent") or {}).get("type")
-            or project.get_vars("coding_agent_type")
-            or "opencode"
-        )
+        installed_agents, agent_type = configured_agents(project)
         return {
             "vm_ip": self.vm_ip,
             "ssh_key_path": f"/tmp/{self.ssh_key_name}",
             "agent_type": agent_type,
+            "agent_types": installed_agents,
             "remote_command": self.agent_remote_command(agent_type),
             "agent_status": "installed" if self.vm_ip else "not installed",
         }
@@ -2517,6 +2516,7 @@ PROVISION_PLAYBOOK = r"""---
   gather_facts: true
   vars:
     coding_agent_type: "{{ coding_agent_type | default('opencode') }}"
+    _rig_agent_types: "{{ coding_agent_types | default([coding_agent_type]) }}"
     code_server_port: "{{ code_server_port | default(8080) }}"
     code_server_user: "{{ code_server_user | default('coder') }}"
   tasks:
@@ -2655,7 +2655,7 @@ PROVISION_PLAYBOOK = r"""---
         executable: /bin/bash
       environment:
         HOME: /root
-      when: coding_agent_type == "opencode"
+      when: "'opencode' in _rig_agent_types"
 
     - name: Symlink OpenCode onto PATH
       file:
@@ -2663,35 +2663,35 @@ PROVISION_PLAYBOOK = r"""---
         dest: /usr/local/bin/opencode
         state: link
         force: true
-      when: coding_agent_type == "opencode"
+      when: "'opencode' in _rig_agent_types"
 
     - name: Ensure OpenCode bin is on PATH for login shells
       lineinfile:
         path: /root/.bashrc
         line: 'export PATH="$HOME/.opencode/bin:$PATH"'
         create: true
-      when: coding_agent_type == "opencode"
+      when: "'opencode' in _rig_agent_types"
 
     - name: Ensure OpenCode config directory exists
       file:
         path: /root/.config/opencode
         state: directory
         mode: "0700"
-      when: coding_agent_type == "opencode"
+      when: "'opencode' in _rig_agent_types"
 
     - name: Deploy OpenCode config from .rig/.opencode
       copy:
         src: "{{ playbook_dir }}/.opencode/opencode.json"
         dest: /root/.config/opencode/opencode.json
         mode: "0600"
-      when: coding_agent_type == "opencode"
+      when: "'opencode' in _rig_agent_types"
 
     - name: Deploy OpenCode MCP config from .rig/.opencode
       copy:
         src: "{{ playbook_dir }}/.opencode/mcp.json"
         dest: /root/.config/opencode/mcp.json
         mode: "0600"
-      when: coding_agent_type == "opencode"
+      when: "'opencode' in _rig_agent_types"
 
     - name: Merge OpenCode MCP servers into opencode.json
       shell: |
@@ -2708,14 +2708,14 @@ PROVISION_PLAYBOOK = r"""---
             json.dump(cfg, handle, indent=2)
             handle.write("\n")
         PY
-      when: coding_agent_type == "opencode"
+      when: "'opencode' in _rig_agent_types"
 
     - name: Deploy AGENTS.md as OpenCode global rules
       copy:
         src: "{{ playbook_dir }}/AGENTS.md"
         dest: /root/.config/opencode/AGENTS.md
         mode: "0644"
-      when: coding_agent_type == "opencode"
+      when: "'opencode' in _rig_agent_types"
 
     # --- Coding agent: Claude Code ---
     # Do not use creates= alone: verify the binary actually runs (same as OpenCode).
@@ -2743,14 +2743,14 @@ PROVISION_PLAYBOOK = r"""---
         executable: /bin/bash
       environment:
         HOME: /root
-      when: coding_agent_type == "claude"
+      when: "'claude' in _rig_agent_types"
 
     - name: Ensure Claude local bin is on PATH
       lineinfile:
         path: /root/.bashrc
         line: 'export PATH="$HOME/.local/bin:$PATH"'
         create: true
-      when: coding_agent_type == "claude"
+      when: "'claude' in _rig_agent_types"
 
     - name: Symlink Claude onto PATH
       file:
@@ -2758,35 +2758,35 @@ PROVISION_PLAYBOOK = r"""---
         dest: /usr/local/bin/claude
         state: link
         force: true
-      when: coding_agent_type == "claude"
+      when: "'claude' in _rig_agent_types"
 
     - name: Ensure Claude config directory exists
       file:
         path: /root/.claude
         state: directory
         mode: "0700"
-      when: coding_agent_type == "claude"
+      when: "'claude' in _rig_agent_types"
 
     - name: Deploy Claude settings from .rig/.claude
       copy:
         src: "{{ playbook_dir }}/.claude/settings.json"
         dest: /root/.claude/settings.json
         mode: "0600"
-      when: coding_agent_type == "claude"
+      when: "'claude' in _rig_agent_types"
 
     - name: Deploy Claude MCP config as project .mcp.json
       copy:
         src: "{{ playbook_dir }}/.claude/mcp.json"
         dest: /root/.mcp.json
         mode: "0600"
-      when: coding_agent_type == "claude"
+      when: "'claude' in _rig_agent_types"
 
     - name: Deploy AGENTS.md as Claude global rules (CLAUDE.md)
       copy:
         src: "{{ playbook_dir }}/AGENTS.md"
         dest: /root/.claude/CLAUDE.md
         mode: "0644"
-      when: coding_agent_type == "claude"
+      when: "'claude' in _rig_agent_types"
 
     - name: Place AGENTS.md in workspace for agent discovery
       copy:
@@ -2811,14 +2811,14 @@ PROVISION_PLAYBOOK = r"""---
         executable: /bin/bash
       environment:
         HOME: /root
-      when: coding_agent_type == "cursor"
+      when: "'cursor' in _rig_agent_types"
 
     - name: Ensure Cursor local bin is on PATH
       lineinfile:
         path: /root/.bashrc
         line: 'export PATH="$HOME/.local/bin:$PATH"'
         create: true
-      when: coding_agent_type == "cursor"
+      when: "'cursor' in _rig_agent_types"
 
     - name: Symlink Cursor agent onto PATH
       file:
@@ -2826,28 +2826,28 @@ PROVISION_PLAYBOOK = r"""---
         dest: /usr/local/bin/agent
         state: link
         force: true
-      when: coding_agent_type == "cursor"
+      when: "'cursor' in _rig_agent_types"
 
     - name: Ensure Cursor config directory exists
       file:
         path: /root/.cursor
         state: directory
         mode: "0700"
-      when: coding_agent_type == "cursor"
+      when: "'cursor' in _rig_agent_types"
 
     - name: Deploy Cursor CLI config from .rig/.cursor
       copy:
         src: "{{ playbook_dir }}/.cursor/cli-config.json"
         dest: /root/.cursor/cli-config.json
         mode: "0600"
-      when: coding_agent_type == "cursor"
+      when: "'cursor' in _rig_agent_types"
 
     - name: Deploy Cursor MCP config from .rig/.cursor
       copy:
         src: "{{ playbook_dir }}/.cursor/mcp.json"
         dest: /root/.cursor/mcp.json
         mode: "0600"
-      when: coding_agent_type == "cursor"
+      when: "'cursor' in _rig_agent_types"
 """
 
 # User image customization (.rig/configure.yml). Cached with provision; never secrets.
@@ -2875,6 +2875,7 @@ AUTHORIZE_PLAYBOOK = r"""---
   gather_facts: false
   vars:
     coding_agent_type: "{{ coding_agent_type | default('opencode') }}"
+    _rig_agent_types: "{{ coding_agent_types | default([coding_agent_type]) }}"
     code_server_port: "{{ code_server_port | default(8080) }}"
     code_server_user: "{{ code_server_user | default('coder') }}"
   tasks:
@@ -2900,71 +2901,112 @@ AUTHORIZE_PLAYBOOK = r"""---
         daemon_reload: true
       when: vscode_browser_password is defined and vscode_browser_password | length > 0
 
+    - name: Resolve per-agent API keys
+      set_fact:
+        rig_opencode_api_key: "{{ opencode_api_key | default('') }}"
+        rig_claude_api_key: "{{ claude_api_key | default('') }}"
+        rig_cursor_api_key: "{{ cursor_api_key | default('') }}"
+      no_log: true
+
+    - name: Use legacy coding_agent_api_key for a single OpenCode install
+      set_fact:
+        rig_opencode_api_key: "{{ coding_agent_api_key }}"
+      no_log: true
+      when:
+        - _rig_agent_types | length == 1
+        - (_rig_agent_types[0] | string) == "opencode"
+        - rig_opencode_api_key | length == 0
+        - coding_agent_api_key is defined
+        - coding_agent_api_key | length > 0
+
+    - name: Use legacy coding_agent_api_key for a single Claude Code install
+      set_fact:
+        rig_claude_api_key: "{{ coding_agent_api_key }}"
+      no_log: true
+      when:
+        - _rig_agent_types | length == 1
+        - (_rig_agent_types[0] | string) == "claude"
+        - rig_claude_api_key | length == 0
+        - coding_agent_api_key is defined
+        - coding_agent_api_key | length > 0
+
+    - name: Use legacy coding_agent_api_key for a single Cursor CLI install
+      set_fact:
+        rig_cursor_api_key: "{{ coding_agent_api_key }}"
+      no_log: true
+      when:
+        - _rig_agent_types | length == 1
+        - (_rig_agent_types[0] | string) == "cursor"
+        - rig_cursor_api_key | length == 0
+        - coding_agent_api_key is defined
+        - coding_agent_api_key | length > 0
+
     - name: Write OpenCode credentials env file
       copy:
         dest: /root/.config/opencode/credentials.env
         mode: "0600"
         content: |
-          CODING_AGENT_API_KEY={{ coding_agent_api_key }}
-          ANTHROPIC_API_KEY={{ coding_agent_api_key }}
-          OPENCODE_API_KEY={{ coding_agent_api_key }}
+          CODING_AGENT_API_KEY={{ rig_opencode_api_key }}
+          ANTHROPIC_API_KEY={{ rig_opencode_api_key }}
+          OPENCODE_API_KEY={{ rig_opencode_api_key }}
       no_log: true
       when:
-        - coding_agent_type == "opencode"
-        - coding_agent_api_key is defined
-        - coding_agent_api_key | length > 0
+        - "'opencode' in _rig_agent_types"
+        - rig_opencode_api_key | length > 0
 
     - name: Write Claude credentials env file
       copy:
         dest: /root/.claude/credentials.env
         mode: "0600"
         content: |
-          CODING_AGENT_API_KEY={{ coding_agent_api_key }}
-          ANTHROPIC_API_KEY={{ coding_agent_api_key }}
+          CODING_AGENT_API_KEY={{ rig_claude_api_key }}
+          ANTHROPIC_API_KEY={{ rig_claude_api_key }}
       no_log: true
       when:
-        - coding_agent_type == "claude"
-        - coding_agent_api_key is defined
-        - coding_agent_api_key | length > 0
+        - "'claude' in _rig_agent_types"
+        - rig_claude_api_key | length > 0
 
     - name: Write Cursor credentials env file
       copy:
         dest: /root/.cursor/credentials.env
         mode: "0600"
         content: |
-          CODING_AGENT_API_KEY={{ coding_agent_api_key }}
-          CURSOR_API_KEY={{ coding_agent_api_key }}
+          CODING_AGENT_API_KEY={{ rig_cursor_api_key }}
+          CURSOR_API_KEY={{ rig_cursor_api_key }}
       no_log: true
       when:
-        - coding_agent_type == "cursor"
-        - coding_agent_api_key is defined
-        - coding_agent_api_key | length > 0
+        - "'cursor' in _rig_agent_types"
+        - rig_cursor_api_key | length > 0
 
     - name: Install coding-agent profile.d env exports
       copy:
         dest: /etc/profile.d/rig-coding-agent.sh
         mode: "0644"
         content: |
-          # Managed by rig authorize.yml — API key for the selected coding agent.
-          if [ -f /root/.config/opencode/credentials.env ]; then
+          # Managed by rig authorize.yml — load the default agent's key only.
+          # `rig attach --agent` sources that agent's credentials.env itself so
+          # several installed agents do not overwrite one shared variable.
+          _rig_default="{{ coding_agent_type | default('opencode') }}"
+          if [ "$_rig_default" = "claude" ] && [ -f /root/.claude/credentials.env ]; then
+            set -a
+            # shellcheck disable=SC1091
+            . /root/.claude/credentials.env
+            set +a
+          elif [ "$_rig_default" = "cursor" ] && [ -f /root/.cursor/credentials.env ]; then
+            set -a
+            # shellcheck disable=SC1091
+            . /root/.cursor/credentials.env
+            set +a
+          elif [ -f /root/.config/opencode/credentials.env ]; then
             set -a
             # shellcheck disable=SC1091
             . /root/.config/opencode/credentials.env
             set +a
           fi
-          if [ -f /root/.claude/credentials.env ]; then
-            set -a
-            # shellcheck disable=SC1091
-            . /root/.claude/credentials.env
-            set +a
-          fi
-          if [ -f /root/.cursor/credentials.env ]; then
-            set -a
-            # shellcheck disable=SC1091
-            . /root/.cursor/credentials.env
-            set +a
-          fi
-      when: coding_agent_api_key is defined and coding_agent_api_key | length > 0
+      when: >-
+        (rig_opencode_api_key | default('') | length > 0)
+        or (rig_claude_api_key | default('') | length > 0)
+        or (rig_cursor_api_key | default('') | length > 0)
 """
 
 # Materialize playbook (.rig/materialize.yml). Project content after authorize.
@@ -3352,11 +3394,29 @@ class ProjectConfig:
             print(f"Warning: Could not save project config: {e}")
             return False
 
+    def _set_agent_selection(
+        self,
+        agent_types: Any,
+        default: Any = None,
+    ) -> List[str]:
+        """Persist the install set, attach default, and credential var names."""
+        from cli.agents import apply_agent_selection
+
+        agent_cfg = self.config.setdefault("agent", {})
+        return apply_agent_selection(agent_cfg, agent_types, default=default)
+
+    def _selected_default_agent(self, selected: List[str]) -> str:
+        primary = (self.config.get("agent") or {}).get("type")
+        if isinstance(primary, str) and primary in selected:
+            return primary
+        return selected[0]
+
     def init(
         self,
         name: Optional[str] = None,
         ansible_enabled: bool = True,
         agent_type: Optional[str] = None,
+        agent_types: Optional[List[str]] = None,
     ) -> bool:
         """Idempotently initialize project config, adding any missing files."""
         try:
@@ -3400,12 +3460,19 @@ class ProjectConfig:
                 if yaml.dump(self.config, sort_keys=True) != before and self.RIG_YAML not in created:
                     created.append(f"{self.RIG_YAML} (updated)")
 
-            if agent_type:
-                from cli.agents import normalize_agent_type
-                chosen = normalize_agent_type(agent_type)
-                self.config.setdefault("agent", {})
-                self.config["agent"]["type"] = chosen
-                self.config["agent"]["credentials_var"] = "coding_agent_api_key"
+            from cli.agents import resolve_configured_agents
+            if agent_types is not None or agent_type is not None:
+                selected_agents = self._set_agent_selection(
+                    agent_types if agent_types is not None else agent_type,
+                    default=agent_type,
+                )
+            else:
+                selected_agents, primary = resolve_configured_agents(
+                    self.config.get("agent") or {}
+                )
+                selected_agents = self._set_agent_selection(
+                    selected_agents, default=primary
+                )
 
             if not self.requirements:
                 self.requirements = [
@@ -3455,18 +3522,23 @@ class ProjectConfig:
                 return False
 
             from cli.agents import ensure_agent_scaffold
-            scaffold_agent = (self.config.get("agent") or {}).get("type") or "opencode"
-            for path in ensure_agent_scaffold(self.rig_dir, agent_type=scaffold_agent):
-                created.append(path)
+            for scaffold_agent in selected_agents:
+                for path in ensure_agent_scaffold(
+                    self.rig_dir, agent_type=scaffold_agent
+                ):
+                    created.append(path)
             # Keep vars in sync for provision.yml conditionals.
             if self.vars_config is not None:
-                self.vars_config["coding_agent_type"] = scaffold_agent
+                default_agent = self._selected_default_agent(selected_agents)
+                self.vars_config["coding_agent_type"] = default_agent
+                self.vars_config["coding_agent_types"] = list(selected_agents)
                 vars_path = os.path.join(self.rig_dir, self.VARS_YAML)
                 if os.path.exists(vars_path) or write_vars:
                     disk = self._load_vars_with_vault(vars_path) if os.path.exists(vars_path) else {}
                     if disk:
                         self.vars_config = {**disk, **self.vars_config}
-                    self.vars_config["coding_agent_type"] = scaffold_agent
+                    self.vars_config["coding_agent_type"] = default_agent
+                    self.vars_config["coding_agent_types"] = list(selected_agents)
                     self._dump_vars(vars_path)
 
             for stage, was_missing in missing.items():
@@ -3828,6 +3900,7 @@ class Workspace:
         repos: Optional[List[Dict[str, str]]] = None,
         password_vars: Optional[Dict[str, str]] = None,
         agent_type: Optional[str] = None,
+        agent_types: Optional[List[str]] = None,
         editor: Optional[str] = None,
     ) -> bool:
         """Idempotently initialize workspace config and register selected repos."""
@@ -3838,29 +3911,39 @@ class Workspace:
 
         selected = repos or []
         password_vars = password_vars or {}
-        from cli.agents import normalize_agent_type
-        chosen_agent = normalize_agent_type(agent_type or "opencode")
+        from cli.agents import coerce_agent_types, normalize_agent_type
+        chosen_agents = coerce_agent_types(
+            agent_types if agent_types is not None else (agent_type or "opencode")
+        ) or ["opencode"]
+        chosen_agent = chosen_agents[0]
+        if isinstance(agent_type, str) and agent_type.strip():
+            try:
+                candidate = normalize_agent_type(agent_type)
+            except ValueError:
+                candidate = None
+            if candidate in chosen_agents:
+                chosen_agent = candidate
         try:
             chosen_editor = normalize_editor_type(editor or DEFAULT_EDITOR)
         except ValueError:
             chosen_editor = DEFAULT_EDITOR
 
         project = ProjectConfig(self.path)
-        # Pass agent_type into init so scaffold/config persist before add_repo reloads.
+        # Pass agents into init so scaffold/config persist before add_repo reloads.
         if not project.init(
             name=workspace_name,
             ansible_enabled=True,
             agent_type=chosen_agent,
+            agent_types=chosen_agents,
         ):
             return False
 
         project.config["kind"] = "workspace"
         project.config["name"] = workspace_name
-        project.config.setdefault("agent", {})
-        project.config["agent"]["type"] = chosen_agent
-        project.config["agent"]["credentials_var"] = "coding_agent_api_key"
+        project._set_agent_selection(chosen_agents, default=chosen_agent)
         project.config["editor"] = chosen_editor
         project.set_vars("coding_agent_type", chosen_agent)
+        project.set_vars("coding_agent_types", list(chosen_agents))
 
         existing_repos = [
             repo for repo in (project.config.get("repos") or [])
@@ -3937,11 +4020,10 @@ class Workspace:
         project.config["repos"] = list(by_name.values())
         project.config["git_providers"] = providers
         # Re-apply after add_repo/load cycles so agent/editor choice is not lost.
-        project.config.setdefault("agent", {})
-        project.config["agent"]["type"] = chosen_agent
-        project.config["agent"]["credentials_var"] = "coding_agent_api_key"
+        project._set_agent_selection(chosen_agents, default=chosen_agent)
         project.config["editor"] = chosen_editor
         project.set_vars("coding_agent_type", chosen_agent)
+        project.set_vars("coding_agent_types", list(chosen_agents))
 
         if not project.save(write_vars=False):
             return False
@@ -3956,7 +4038,14 @@ class Workspace:
             print("Included projects: " + ", ".join(sorted(by_name)))
         if providers:
             print("Git providers: " + ", ".join(providers))
-        print(f"Coding agent: {chosen_agent}")
+        if len(chosen_agents) == 1:
+            print(f"Coding agent: {chosen_agent}")
+        else:
+            print(
+                "Coding agents: "
+                + ", ".join(chosen_agents)
+                + f" (attach default: {chosen_agent})"
+            )
         print(f"Editor: {chosen_editor}")
         return True
 
@@ -3970,10 +4059,15 @@ def interactive_env_init(
 ) -> bool:
     """Interactively initialize (or reinitialize) an environment."""
     from cli.config import RigConfig, ensure_credentials
-    from cli.agents import prompt_coding_agent
+    from cli.agents import (
+        prompt_coding_agents,
+        prompt_default_agent,
+        resolve_configured_agents,
+    )
     from cli.encrypt import (
         collect_repo_pats,
         prompt_and_store_coding_agent_credentials,
+        prompt_and_store_coding_agents_credentials,
         resolve_repo_pat_var_names,
         store_repo_pats,
     )
@@ -4078,9 +4172,24 @@ def interactive_env_init(
             print("Error: environment name is required")
             return False
 
-    existing_agent = (existing.get("agent") or {}).get("type") or "opencode"
+    existing_agents, existing_default = resolve_configured_agents(
+        existing.get("agent") or {}
+    )
     try:
-        agent_type = prompt_coding_agent(default=existing_agent, input_fn=input_fn)
+        agent_types = prompt_coding_agents(
+            default=existing_agents, input_fn=input_fn
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return False
+    if isinstance(agent_types, str):
+        from cli.agents import coerce_agent_types
+        agent_types = coerce_agent_types(agent_types) or ["opencode"]
+    try:
+        preferred = existing_default if existing_default in agent_types else agent_types[0]
+        agent_type = prompt_default_agent(
+            agent_types, default=preferred, input_fn=input_fn
+        )
     except ValueError as exc:
         print(f"Error: {exc}")
         return False
@@ -4109,6 +4218,7 @@ def interactive_env_init(
         repos=selected,
         password_vars=password_vars,
         agent_type=agent_type,
+        agent_types=agent_types,
         editor=editor,
     ):
         return False
@@ -4123,19 +4233,31 @@ def interactive_env_init(
         )
     except (ValueError, RuntimeError) as exc:
         print(f"Warning: could not store git PATs: {exc}")
-    stored_agent_key = False
+    stored_by_agent: Dict[str, bool] = {}
     try:
-        stored_agent_key = bool(
-            prompt_and_store_coding_agent_credentials(
-                project_dir=root,
-                data_key_path=data_key_path,
-                input_fn=input_fn,
-                secret_fn=secret_fn,
-                agent_type=agent_type,
+        if len(agent_types) == 1:
+            stored_by_agent[agent_types[0]] = bool(
+                prompt_and_store_coding_agent_credentials(
+                    project_dir=root,
+                    data_key_path=data_key_path,
+                    input_fn=input_fn,
+                    secret_fn=secret_fn,
+                    agent_type=agent_types[0],
+                )
             )
-        )
+        else:
+            stored_by_agent = {
+                str(key): bool(value)
+                for key, value in prompt_and_store_coding_agents_credentials(
+                    agent_types,
+                    project_dir=root,
+                    data_key_path=data_key_path,
+                    input_fn=input_fn,
+                    secret_fn=secret_fn,
+                ).items()
+            }
     except (ValueError, RuntimeError) as exc:
-        print(f"Warning: could not store coding_agent_api_key: {exc}")
+        print(f"Warning: could not store coding agent API keys: {exc}")
 
     try:
         from cli.encrypt import (
@@ -4156,19 +4278,25 @@ def interactive_env_init(
 
     # OpenCode: free Zen models by default; switch to keyed config when a key exists.
     try:
-        from cli.agents import normalize_agent_type, sync_opencode_config
-        if normalize_agent_type(agent_type) == "opencode":
+        from cli.agents import sync_opencode_config
+        if "opencode" in agent_types:
+            has_opencode_key = bool(stored_by_agent.get("opencode"))
             written = sync_opencode_config(
                 os.path.join(root, ".rig"),
-                has_api_key=stored_agent_key,
-                force=stored_agent_key,
+                has_api_key=has_opencode_key,
+                force=has_opencode_key,
             )
-            if stored_agent_key and written:
-                print("OpenCode config set to use coding_agent_api_key")
-            elif not stored_agent_key:
+            if has_opencode_key and written:
+                key_name = (
+                    "opencode_api_key"
+                    if len(agent_types) > 1
+                    else "coding_agent_api_key"
+                )
+                print(f"OpenCode config set to use {key_name}")
+            elif not has_opencode_key:
                 print(
                     "OpenCode config uses free models "
-                    "(set coding_agent_api_key to use a paid provider)"
+                    "(set an OpenCode API key to use a paid provider)"
                 )
     except ValueError:
         pass

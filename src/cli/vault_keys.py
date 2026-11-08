@@ -433,7 +433,14 @@ def write_filtered_vars_copy(src_path: str, dest_path: str) -> Optional[str]:
 def is_personal_secret_name(name: str) -> bool:
     """Heuristic: PATs and coding agent key are personal."""
     n = (name or "").strip()
-    if n in {"coding_agent_api_key", "github_pat", "gitlab_pat"}:
+    if n in {
+        "coding_agent_api_key",
+        "opencode_api_key",
+        "claude_api_key",
+        "cursor_api_key",
+        "github_pat",
+        "gitlab_pat",
+    }:
         return True
     if n.endswith("_git_pat"):
         return True

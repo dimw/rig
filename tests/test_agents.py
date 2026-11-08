@@ -6,12 +6,20 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import pytest
+
 from cli.agents import (
     OPENCODE_FREE_MODEL,
+    apply_agent_selection,
+    coerce_agent_types,
     ensure_agent_scaffold,
     normalize_agent_type,
     opencode_config,
+    parse_agent_selection,
     prompt_coding_agent,
+    prompt_coding_agents,
+    prompt_default_agent,
+    resolve_configured_agents,
     sync_opencode_config,
 )
 
@@ -78,3 +86,107 @@ def test_prompt_coding_agent_default():
     assert prompt_coding_agent(default="opencode", input_fn=lambda _p: "") == "opencode"
     assert prompt_coding_agent(default="opencode", input_fn=lambda _p: "claude") == "claude"
     assert prompt_coding_agent(default="opencode", input_fn=lambda _p: "cursor") == "cursor"
+
+
+def test_prompt_coding_agents_multi_choice():
+    assert prompt_coding_agents(default="opencode", input_fn=lambda _p: "") == ["opencode"]
+    assert prompt_coding_agents(default="claude", input_fn=lambda _p: "1,3") == [
+        "opencode",
+        "cursor",
+    ]
+    assert prompt_coding_agents(default=["cursor"], input_fn=lambda _p: "all") == [
+        "opencode",
+        "claude",
+        "cursor",
+    ]
+    assert prompt_coding_agents(
+        default="opencode", input_fn=lambda _p: "claude, cursor"
+    ) == ["claude", "cursor"]
+    with pytest.raises(ValueError):
+        prompt_coding_agents(default="opencode", input_fn=lambda _p: "nope")
+
+
+def test_prompt_default_agent_among_selected():
+    assert prompt_default_agent(["claude"], input_fn=lambda _p: "cursor") == "claude"
+    assert prompt_default_agent(
+        ["opencode", "claude"], default="opencode", input_fn=lambda _p: ""
+    ) == "opencode"
+    assert prompt_default_agent(
+        ["opencode", "cursor"], default="opencode", input_fn=lambda _p: "3"
+    ) == "cursor"
+    assert prompt_default_agent(
+        ["opencode", "claude"], default="opencode", input_fn=lambda _p: "claude"
+    ) == "claude"
+    with pytest.raises(ValueError):
+        prompt_default_agent(
+            ["opencode", "claude"], input_fn=lambda _p: "cursor"
+        )
+
+
+class _Label:
+    def __init__(self, text):
+        self.text = text
+
+    def __str__(self):
+        return self.text
+
+
+def test_coerce_agent_types_edges():
+    assert coerce_agent_types(None) == []
+    assert coerce_agent_types("  ") == []
+    assert coerce_agent_types(["opencode", None, "opencode", "claude"]) == [
+        "opencode",
+        "claude",
+    ]
+    assert coerce_agent_types(_Label("cursor")) == ["cursor"]
+    assert coerce_agent_types(_Label("  ")) == []
+
+
+def test_resolve_and_apply_ignore_unknown_names():
+    installed, default = resolve_configured_agents(
+        {"types": ["nope"], "type": "nope"},
+        coding_agent_type="cursor",
+    )
+    assert installed == ["cursor"]
+    assert default == "cursor"
+    installed, default = resolve_configured_agents(
+        {"types": ["nope"], "type": "nope"},
+        coding_agent_type="also-nope",
+    )
+    assert installed == ["opencode"]
+    assert default == "opencode"
+    installed, default = resolve_configured_agents(
+        {"types": ["opencode", "claude"], "type": "nope"}
+    )
+    assert default == "opencode"
+
+    cfg = {}
+    selected = apply_agent_selection(cfg, ["opencode", "claude"], default="nope")
+    assert selected == ["opencode", "claude"]
+    assert cfg["type"] == "opencode"
+    apply_agent_selection(cfg, ["opencode", "claude"], default="cursor")
+    assert cfg["type"] == "opencode"
+
+
+def test_parse_and_prompt_agent_selection_edges():
+    assert parse_agent_selection("", default=["nope"]) == ["opencode"]
+    assert parse_agent_selection(",,", default=["claude"]) == ["claude"]
+    with pytest.raises(ValueError):
+        parse_agent_selection("9", default=["opencode"])
+    assert prompt_coding_agents(default="nope", input_fn=lambda _p: "") == ["opencode"]
+    assert prompt_default_agent(
+        ["opencode", "claude"], default="nope", input_fn=lambda _p: ""
+    ) == "opencode"
+    with pytest.raises(ValueError):
+        prompt_default_agent(["opencode", "claude"], input_fn=lambda _p: "3")
+
+
+def test_resolve_configured_agents_prefers_types_and_default():
+    installed, default = resolve_configured_agents(
+        {"type": "cursor", "types": ["opencode", "claude", "cursor"]}
+    )
+    assert installed == ["opencode", "claude", "cursor"]
+    assert default == "cursor"
+    installed, default = resolve_configured_agents({"type": "claude"})
+    assert installed == ["claude"]
+    assert default == "claude"

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 SUPPORTED_AGENTS = ("opencode", "claude", "cursor")
 
@@ -28,7 +28,24 @@ AGENT_LABELS = {
     "cursor": "Cursor CLI",
 }
 
-# Env var name referenced from generated configs; set by system.yml on the VM.
+# Per-agent vault var. A single selected agent still uses the legacy shared name
+# so existing ``coding_agent_api_key`` values keep working.
+AGENT_API_KEY_VARS = {
+    "opencode": "opencode_api_key",
+    "claude": "claude_api_key",
+    "cursor": "cursor_api_key",
+}
+
+# Distinct env fallbacks so several agents are not given the same key.
+AGENT_API_KEY_ENVS = {
+    "opencode": "RIG_OPENCODE_API_KEY",
+    "claude": "RIG_ANTHROPIC_API_KEY",
+    "cursor": "RIG_CURSOR_API_KEY",
+}
+
+LEGACY_CODING_AGENT_API_KEY = "coding_agent_api_key"
+
+# Env var name referenced from generated configs; set by authorize.yml on the VM.
 CODING_AGENT_API_KEY_ENV = "CODING_AGENT_API_KEY"
 
 DEFAULT_AGENTS_MD = """# Workspace rules
@@ -290,7 +307,7 @@ def prompt_coding_agent(
     default: str = "opencode",
     input_fn: Optional[Callable[..., str]] = None,
 ) -> str:
-    """Ask which coding agent to use."""
+    """Ask which coding agent to use (single choice)."""
     ask = input_fn or input
     try:
         default = normalize_agent_type(default)
@@ -301,3 +318,238 @@ def prompt_coding_agent(
     if not answer:
         return default
     return normalize_agent_type(answer)
+
+
+def coerce_agent_types(value: Any) -> List[str]:
+    """
+    Normalize a string, comma-separated string, or list into agent ids.
+
+    Order is preserved and duplicates are dropped. Empty input returns [].
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        parts = [part.strip() for part in text.replace(" ", ",").split(",") if part.strip()]
+    elif isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                parts.append(text)
+    else:
+        text = str(value).strip()
+        parts = [text] if text else []
+
+    selected: List[str] = []
+    seen = set()
+    for part in parts:
+        agent = normalize_agent_type(part)
+        if agent not in seen:
+            selected.append(agent)
+            seen.add(agent)
+    return selected
+
+
+def resolve_configured_agents(
+    agent_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    coding_agent_type: Any = None,
+    coding_agent_types: Any = None,
+) -> Tuple[List[str], str]:
+    """
+    Return ``(installed_agents, default_attach_agent)``.
+
+    ``agent.types`` / ``coding_agent_types`` is the install set.
+    ``agent.type`` is the attach default when it is a member of that set.
+    """
+    agent_cfg = agent_cfg or {}
+    types: List[str] = []
+    for candidate in (agent_cfg.get("types"), coding_agent_types):
+        if not candidate:
+            continue
+        try:
+            types = coerce_agent_types(candidate)
+        except ValueError:
+            types = []
+        if types:
+            break
+    if not types:
+        raw_type = agent_cfg.get("type")
+        if raw_type:
+            try:
+                types = coerce_agent_types(raw_type)
+            except ValueError:
+                types = []
+        if not types and coding_agent_type:
+            try:
+                types = coerce_agent_types(coding_agent_type)
+            except ValueError:
+                types = []
+    if not types:
+        types = ["opencode"]
+
+    primary: Optional[str] = None
+    raw_primary = agent_cfg.get("type")
+    if isinstance(raw_primary, str) and raw_primary.strip():
+        try:
+            primary = normalize_agent_type(raw_primary)
+        except ValueError:
+            primary = None
+    if primary not in types:
+        primary = types[0]
+    return types, primary
+
+
+def apply_agent_selection(
+    agent_cfg: Dict[str, Any],
+    agent_types: Sequence[str],
+    default: Any = None,
+) -> List[str]:
+    """
+    Write ``type``, ``types``, and credential var names onto an agent config dict.
+
+    ``type`` is the attach default. It is ``default`` when that agent was
+    selected, otherwise the first selected agent.
+    A single agent keeps ``credentials_var: coding_agent_api_key``.
+    Several agents each get their own vault var under ``credentials``.
+    """
+    selected = coerce_agent_types(agent_types) or ["opencode"]
+    primary: Optional[str] = None
+    if isinstance(default, str) and default.strip():
+        try:
+            primary = normalize_agent_type(default)
+        except ValueError:
+            primary = None
+    if primary not in selected:
+        primary = selected[0]
+    agent_cfg["type"] = primary
+    agent_cfg["types"] = list(selected)
+    if len(selected) == 1:
+        agent_cfg["credentials_var"] = LEGACY_CODING_AGENT_API_KEY
+        agent_cfg.pop("credentials", None)
+    else:
+        agent_cfg["credentials"] = {
+            agent: AGENT_API_KEY_VARS[agent] for agent in selected
+        }
+        agent_cfg["credentials_var"] = AGENT_API_KEY_VARS[primary]
+    return selected
+
+
+def parse_agent_selection(
+    answer: str,
+    *,
+    default: Sequence[str],
+) -> List[str]:
+    """Parse 'all', indexes, or names the same way git project selection works."""
+    try:
+        defaults = coerce_agent_types(list(default)) or ["opencode"]
+    except ValueError:
+        defaults = ["opencode"]
+    raw = (answer or "").strip()
+    if not raw:
+        return defaults
+    if raw.lower() in ("all", "*"):
+        return list(SUPPORTED_AGENTS)
+
+    selected: List[str] = []
+    seen = set()
+    tokens = [token.strip() for token in raw.replace(" ", ",").split(",") if token.strip()]
+    if not tokens:
+        return defaults
+    for token in tokens:
+        if token.isdigit():
+            index = int(token) - 1
+            if not 0 <= index < len(SUPPORTED_AGENTS):
+                raise ValueError(
+                    f"Coding agent number {token} is out of range. "
+                    f"Choose 1-{len(SUPPORTED_AGENTS)}, names, or all."
+                )
+            agent = SUPPORTED_AGENTS[index]
+        else:
+            agent = normalize_agent_type(token)
+        if agent not in seen:
+            selected.append(agent)
+            seen.add(agent)
+    return selected
+
+
+def prompt_coding_agents(
+    default: Any = "opencode",
+    input_fn: Optional[Callable[..., str]] = None,
+) -> List[str]:
+    """
+    Ask which coding agents to install.
+
+    Accepts numbers, names, or ``all``, like the git project picker.
+    Enter keeps ``default``.
+    """
+    ask = input_fn or input
+    try:
+        defaults = coerce_agent_types(default) or ["opencode"]
+    except ValueError:
+        defaults = ["opencode"]
+    print("Coding agents:")
+    for index, agent in enumerate(SUPPORTED_AGENTS, start=1):
+        print(f"  {index}. {agent} ({AGENT_LABELS[agent]})")
+    default_label = ",".join(defaults)
+    answer = ask(
+        "Coding agents to include (numbers, names, or all) "
+        f"[{default_label}]: "
+    )
+    return parse_agent_selection(answer, default=defaults)
+
+
+def prompt_default_agent(
+    selected: Sequence[str],
+    default: Any = None,
+    input_fn: Optional[Callable[..., str]] = None,
+) -> str:
+    """
+    Ask which selected agent ``rig attach`` should open.
+
+    A single selected agent is returned without a prompt. Numbers match the
+    catalog shown by ``prompt_coding_agents`` (not a renumbered sub-list).
+    """
+    agents = coerce_agent_types(list(selected)) or ["opencode"]
+    if len(agents) == 1:
+        return agents[0]
+    preferred = agents[0]
+    if isinstance(default, str) and default.strip():
+        try:
+            candidate = normalize_agent_type(default)
+        except ValueError:
+            candidate = None
+        if candidate in agents:
+            preferred = candidate
+    by_number = {
+        str(index): agent
+        for index, agent in enumerate(SUPPORTED_AGENTS, start=1)
+        if agent in agents
+    }
+    print("Default agent for rig attach:")
+    for number, agent in by_number.items():
+        print(f"  {number}. {agent} ({AGENT_LABELS[agent]})")
+    ask = input_fn or input
+    answer = ask(f"Default agent [{preferred}]: ").strip()
+    if not answer:
+        return preferred
+    if answer.isdigit():
+        numbered = by_number.get(answer)
+        if not numbered:
+            raise ValueError(
+                f"Default agent number {answer} is not one of the selected agents "
+                f"({', '.join(agents)})"
+            )
+        return numbered
+    chosen = normalize_agent_type(answer)
+    if chosen not in agents:
+        raise ValueError(
+            f"Default agent {chosen!r} was not selected. "
+            f"Choose one of: {', '.join(agents)}"
+        )
+    return chosen

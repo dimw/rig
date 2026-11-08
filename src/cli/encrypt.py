@@ -703,58 +703,68 @@ def prompt_and_store_coding_agent_credentials(
     agent_type: Optional[str] = None,
     *,
     personal: Optional[bool] = None,
+    var_name: Optional[str] = None,
+    env_name: Optional[str] = None,
 ) -> bool:
     """
-    Ask for the remote coding agent API key and store ``coding_agent_api_key``.
+    Ask for one coding agent API key and store it.
 
-    Defaults to the identity/personal vars file after an explicit confirmation.
-    Config under ``.rig/.opencode`` / ``.claude`` / ``.cursor`` references the
-    key via env vars on the VM.
+    The default variable is ``coding_agent_api_key`` (single-agent workspaces).
+    Pass ``var_name`` / ``env_name`` when each agent has its own key.
     """
+    from cli.agents import (
+        AGENT_API_KEY_ENVS,
+        AGENT_LABELS,
+        LEGACY_CODING_AGENT_API_KEY,
+        normalize_agent_type,
+    )
+
     label = "Coding agent API key"
+    agent_normalized = None
     if agent_type:
         try:
-            from cli.agents import AGENT_LABELS, normalize_agent_type
-            agent = normalize_agent_type(agent_type)
-            label = f"{AGENT_LABELS.get(agent, agent)} API key"
+            agent_normalized = normalize_agent_type(agent_type)
+            label = f"{AGENT_LABELS.get(agent_normalized, agent_normalized)} API key"
         except ValueError:
-            pass
+            agent_normalized = None
+    stored_name = var_name or LEGACY_CODING_AGENT_API_KEY
+    if env_name:
+        env_var = env_name
+    elif agent_normalized and var_name:
+        env_var = AGENT_API_KEY_ENVS.get(agent_normalized, "RIG_CODING_AGENT_API_KEY")
+    else:
+        env_var = "RIG_CODING_AGENT_API_KEY"
     root = resolve_project_dir(project_dir)
     unlock_data_keys(
         root, input_fn=input_fn, secret_fn=secret_fn, require_wraps=False
     )
-    agent_normalized = None
-    if agent_type:
-        try:
-            from cli.agents import normalize_agent_type
-            agent_normalized = normalize_agent_type(agent_type)
-        except ValueError:
-            agent_normalized = None
     if agent_normalized == "opencode":
         skip_hint = " [Enter = OpenCode free models]"
     elif agent_normalized == "cursor":
         skip_hint = " [Enter = skip; Cursor CLI needs CURSOR_API_KEY on the VM]"
+    elif agent_normalized == "claude":
+        skip_hint = " [Enter = skip; Claude Code needs an Anthropic API key]"
     else:
         skip_hint = ""
     api_key = _prompt_secret_with_env_fallback(
         f"{label}{skip_hint}",
-        "RIG_CODING_AGENT_API_KEY",
+        env_var,
         input_fn=input_fn,
         secret_fn=secret_fn,
     )
     if not api_key:
         if agent_normalized == "opencode":
             print(
-                "Skipping coding_agent_api_key (no key provided); "
+                f"Skipping {stored_name} (no key provided); "
                 "OpenCode will use free models"
             )
         elif agent_normalized == "cursor":
             print(
-                "Skipping coding_agent_api_key (no key provided); "
+                f"Skipping {stored_name} (no key provided); "
                 "set a Cursor user API key before rig attach"
             )
         else:
-            print("Skipping coding_agent_api_key (no key provided)")
+            print(f"Skipping {stored_name} (no key provided)")
         return False
 
     if personal is None:
@@ -765,15 +775,95 @@ def prompt_and_store_coding_agent_credentials(
         PERSONAL_DATA_KEY_PATH if personal else SHARED_DATA_KEY_PATH
     )
     store_encrypted_var(
-        "coding_agent_api_key",
+        stored_name,
         api_key,
         project_dir=root,
         data_key_path=key_path,
         personal=personal,
     )
     scope = "personal" if personal else "shared"
-    print(f"Stored coding_agent_api_key as a {scope} secret")
+    print(f"Stored {stored_name} as a {scope} secret")
     return True
+
+
+def prompt_and_store_coding_agents_credentials(
+    agent_types: list,
+    project_dir: Optional[str] = None,
+    data_key_path: Optional[str] = None,
+    input_fn: Optional[Callable[..., str]] = None,
+    secret_fn: Optional[Callable[..., str]] = None,
+    *,
+    personal: Optional[bool] = None,
+) -> dict:
+    """
+    Ask for a distinct API key per selected coding agent.
+
+    Returns ``{agent_type: stored}``. Personal-vs-shared is confirmed once
+    after the keys are collected, then every non-empty key is stored.
+    """
+    from cli.agents import (
+        AGENT_API_KEY_ENVS,
+        AGENT_API_KEY_VARS,
+        AGENT_LABELS,
+        coerce_agent_types,
+    )
+
+    selected = coerce_agent_types(agent_types)
+    root = resolve_project_dir(project_dir)
+    unlock_data_keys(
+        root, input_fn=input_fn, secret_fn=secret_fn, require_wraps=False
+    )
+    collected: dict = {}
+    for agent in selected:
+        label = f"{AGENT_LABELS.get(agent, agent)} API key"
+        if agent == "opencode":
+            skip_hint = " [Enter = OpenCode free models]"
+        elif agent == "cursor":
+            skip_hint = " [Enter = skip; Cursor CLI needs CURSOR_API_KEY on the VM]"
+        else:
+            skip_hint = " [Enter = skip; Claude Code needs an Anthropic API key]"
+        api_key = _prompt_secret_with_env_fallback(
+            f"{label}{skip_hint}",
+            AGENT_API_KEY_ENVS[agent],
+            input_fn=input_fn,
+            secret_fn=secret_fn,
+        )
+        if not api_key:
+            if agent == "opencode":
+                print(
+                    f"Skipping {AGENT_API_KEY_VARS[agent]} (no key provided); "
+                    "OpenCode will use free models"
+                )
+            elif agent == "cursor":
+                print(
+                    f"Skipping {AGENT_API_KEY_VARS[agent]} (no key provided); "
+                    "set a Cursor user API key before rig attach"
+                )
+            else:
+                print(f"Skipping {AGENT_API_KEY_VARS[agent]} (no key provided)")
+            continue
+        collected[agent] = api_key
+
+    if collected and personal is None:
+        personal = prompt_store_as_personal(
+            "coding agent API keys", input_fn=input_fn
+        )
+    if collected:
+        key_path = data_key_path or (
+            PERSONAL_DATA_KEY_PATH if personal else SHARED_DATA_KEY_PATH
+        )
+        scope = "personal" if personal else "shared"
+        for agent, api_key in collected.items():
+            var_name = AGENT_API_KEY_VARS[agent]
+            store_encrypted_var(
+                var_name,
+                api_key,
+                project_dir=root,
+                data_key_path=key_path,
+                personal=bool(personal),
+            )
+            print(f"Stored {var_name} as a {scope} secret")
+    return {agent: agent in collected for agent in selected}
 
 
 def read_vscode_browser_password(
