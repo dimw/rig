@@ -228,7 +228,7 @@ def test_apply_missing_ssh_key(tok_env, capsys):
     assert "SSH private key" in capsys.readouterr().err
 
 
-def test_create_success_and_no_attach(tok_env, tmp_path):
+def test_create_success_and_no_attach(tok_env, tmp_path, capsys):
     (tmp_path / "rig.yml").write_text("name: p\n")
     with patch("cli.main._load_credentials"), patch(
         "cli.main.StorageManager", side_effect=ValueError("no storage")
@@ -243,12 +243,14 @@ def test_create_success_and_no_attach(tok_env, tmp_path):
         pc_cls.return_value = pc
 
         inst = MagicMock()
+        inst.name = "dev-c1"
         inst.setup.return_value = True
         inst.provision.return_value = True
         inst.attach_to_agent.return_value = 0
         env_cls.return_value = inst
 
         assert main(["create", "--name", "c1"]) == 0
+        assert "Environment 'dev-c1' created" in capsys.readouterr().err
         inst.attach_to_agent.assert_called_once()
         inst.attach_to_agent.reset_mock()
 

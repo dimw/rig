@@ -190,6 +190,7 @@ Global: `-v` playbook tasks and debug · `-vv`/`-vvv`/`-vvvv` ansible verbosity 
 | `create` | `[--name]` `[--provider]` `[--type]` `[--availability-zone]` `[--image]` `[--no-attach]` `[--force-playbooks\|--force-system\|--force-workspace]` | Host defaults from `rig.yml`. `--provider` defaults to `hetzner`. `--type` sets `host.server_type`. `host.type` defaults to `vm`. `--region` aliases `--availability-zone`. |
 | `apply` | `[name]` `[--provision\|--configure\|--authorize\|--materialize]` | Default: authorize then materialize |
 | `attach` | `[name]` `[-c\|--continue]` `[-s\|--session ID]` `[--resume [ID]]` `[--agent opencode\|claude\|cursor]` `[-- …agent args]` | Reopens last remembered session by default; `--agent` picks which installed agent |
+| `ssh` | `[name]` `[-- command]` | Shell on the VM in `/workspace`. A command after `--` runs instead of a login shell |
 | `dev` | `[name]` `[--path /workspace]` `[--browser]` `[--editor code\|cursor\|…]` | Remote-SSH by default; `--editor` opens another IDE from `editor.enabled`. Defaults to `editor.default` |
 | `list` | | Lists envs, or `No remote environments` |
 | `destroy` | `[name …]` | Runs finalize then destroy playbooks first; multi-name OK |

@@ -120,7 +120,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         ):
             return 1
 
-        log.info("Environment created")
+        log.info("Environment '%s' created", env.name)
         remember_last_env(env.name)
         if getattr(args, "no_attach", False):
             log.info("Skipped agent attach; reconnect with: rig attach / rig dev")
@@ -157,15 +157,18 @@ def _merge_agent_args(
     return agent_args
 
 
-def _attach_name_and_remainder(args: argparse.Namespace):
+def _attach_name_and_remainder(
+    args: argparse.Namespace,
+    remainder_attr: str = "agent_args",
+):
     """
-    Split env name from agent argv.
+    Split env name from trailing argv.
 
     Argparse can put flag-like tokens into the optional ``name`` positional
     when users write ``rig attach -- --continue``; move those into remainder.
     """
     name = getattr(args, "name", None)
-    remainder = list(getattr(args, "agent_args", None) or [])
+    remainder = list(getattr(args, remainder_attr, None) or [])
     if name and str(name).startswith("-"):
         remainder = [name] + remainder
         name = None
@@ -276,7 +279,6 @@ def _cmd_attach(args: argparse.Namespace) -> int:
 
         env.ensure_firewall_access(project_dir=os.getcwd())
         remember_last_env(env.name)
-        log.info("Attaching to '%s' (%s)", env.name, env.vm_ip)
         if agent_args:
             log.debug("Agent args: %s", " ".join(agent_args))
         return env.attach_to_agent(
@@ -286,6 +288,61 @@ def _cmd_attach(args: argparse.Namespace) -> int:
         )
     except Exception as e:
         log.error("Error attaching to environment: %s", e)
+        return 1
+
+
+def _cmd_ssh(args: argparse.Namespace) -> int:
+    """Open a shell on an existing environment, or run one remote command."""
+    _load_credentials()
+    hetzner_token = os.getenv('HETZNER_CLOUD_API_TOKEN')
+    if not hetzner_token:
+        log.error("Hetzner credentials missing. Run 'rig init' or set HETZNER_CLOUD_API_TOKEN")
+        return 1
+
+    tokens = list(getattr(args, "ssh_args", None) or [])
+    positional_name = None
+    remainder: list = []
+    if tokens and tokens[0] == "--":
+        remainder = tokens[1:]
+    elif tokens:
+        positional_name = tokens[0]
+        remainder = tokens[1:]
+        if remainder and remainder[0] == "--":
+            remainder = remainder[1:]
+    name = resolve_env_name(
+        positional_name,
+        getattr(args, "name_flag", None),
+    )
+    if not name:
+        log.error("Environment name is required (no last environment remembered)")
+        log.info("Usage: rig ssh [name] [-- command]")
+        return 1
+
+    storage_manager = None
+    try:
+        storage_manager = StorageManager()
+    except ValueError:
+        log.debug("Storage manager not available; resolving resources via Hetzner API")
+
+    try:
+        env = RemoteDevEnvironment(name=name, storage_manager=storage_manager)
+        if not env.resolve_resources() or not env.vm_ip:
+            log.error("Could not resolve environment '%s' (no VM IP found)", name)
+            return 1
+
+        ssh_key_path = f"/tmp/{env.ssh_key_name}"
+        if not os.path.exists(ssh_key_path):
+            log.error("SSH private key not found at %s", ssh_key_path)
+            log.error("Re-run create on this machine, or restore the key before connecting")
+            return 1
+
+        env.ensure_firewall_access(project_dir=os.getcwd())
+        remember_last_env(env.name)
+        import shlex
+        remote = shlex.join(remainder) if remainder else None
+        return env.open_ssh(remote_command=remote)
+    except Exception as e:
+        log.error("Error connecting to environment: %s", e)
         return 1
 
 
@@ -971,6 +1028,21 @@ def main(argv=None):
         help="Extra args forwarded to opencode/claude/agent (put -- before flags)",
     )
 
+    ssh_parser = subparsers.add_parser(
+        "ssh",
+        help="Open an SSH shell on the remote env (uses last env if name omitted)",
+    )
+    ssh_parser.add_argument(
+        "--name",
+        dest="name_flag",
+        help="Environment name (kept for compatibility)",
+    )
+    ssh_parser.add_argument(
+        "ssh_args",
+        nargs=argparse.REMAINDER,
+        help="[name] [-- command]. Default: login shell in /workspace",
+    )
+
     dev_parser = subparsers.add_parser(
         "dev",
         help="Open VS Code / Cursor on the remote env (uses last env if name omitted)",
@@ -1131,6 +1203,8 @@ def main(argv=None):
         return _cmd_apply(args)
     if args.command == "attach":
         return _cmd_attach(args)
+    if args.command == "ssh":
+        return _cmd_ssh(args)
     if args.command == "dev":
         return _cmd_dev(args)
     if args.command == "list":
