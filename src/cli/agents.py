@@ -355,6 +355,23 @@ def coerce_agent_types(value: Any) -> List[str]:
     return selected
 
 
+def agent_default_field(agent_cfg: Optional[Dict[str, Any]] = None) -> Any:
+    """``agent.default``, or the legacy ``agent.type`` string."""
+    agent_cfg = agent_cfg or {}
+    raw = agent_cfg.get("default")
+    if raw not in (None, ""):
+        return raw
+    return agent_cfg.get("type")
+
+
+def agent_enabled_field(agent_cfg: Optional[Dict[str, Any]] = None) -> Any:
+    """``agent.enabled``, or the legacy ``agent.types`` list."""
+    agent_cfg = agent_cfg or {}
+    if agent_cfg.get("enabled"):
+        return agent_cfg.get("enabled")
+    return agent_cfg.get("types")
+
+
 def resolve_configured_agents(
     agent_cfg: Optional[Dict[str, Any]] = None,
     *,
@@ -364,12 +381,13 @@ def resolve_configured_agents(
     """
     Return ``(installed_agents, default_attach_agent)``.
 
-    ``agent.types`` / ``coding_agent_types`` is the install set.
-    ``agent.type`` is the attach default when it is a member of that set.
+    ``agent.enabled`` / ``coding_agent_types`` is the install set.
+    ``agent.default`` is the attach default when it is a member of that set.
+    Legacy ``agent.types`` and ``agent.type`` are still accepted.
     """
     agent_cfg = agent_cfg or {}
     types: List[str] = []
-    for candidate in (agent_cfg.get("types"), coding_agent_types):
+    for candidate in (agent_enabled_field(agent_cfg), coding_agent_types):
         if not candidate:
             continue
         try:
@@ -379,7 +397,7 @@ def resolve_configured_agents(
         if types:
             break
     if not types:
-        raw_type = agent_cfg.get("type")
+        raw_type = agent_default_field(agent_cfg)
         if raw_type:
             try:
                 types = coerce_agent_types(raw_type)
@@ -394,7 +412,7 @@ def resolve_configured_agents(
         types = ["opencode"]
 
     primary: Optional[str] = None
-    raw_primary = agent_cfg.get("type")
+    raw_primary = agent_default_field(agent_cfg)
     if isinstance(raw_primary, str) and raw_primary.strip():
         try:
             primary = normalize_agent_type(raw_primary)
@@ -411,10 +429,10 @@ def apply_agent_selection(
     default: Any = None,
 ) -> List[str]:
     """
-    Write ``type``, ``types``, and credential var names onto an agent config dict.
+    Write ``default``, ``enabled``, and credential var names onto an agent config dict.
 
-    ``type`` is the attach default. It is ``default`` when that agent was
-    selected, otherwise the first selected agent.
+    ``default`` is the attach default. The requested name is used when that
+    agent was selected, otherwise the first selected agent.
     A single agent keeps ``credentials_var: coding_agent_api_key``.
     Several agents each get their own vault var under ``credentials``.
     """
@@ -427,8 +445,10 @@ def apply_agent_selection(
             primary = None
     if primary not in selected:
         primary = selected[0]
-    agent_cfg["type"] = primary
-    agent_cfg["types"] = list(selected)
+    agent_cfg["default"] = primary
+    agent_cfg.pop("type", None)
+    agent_cfg["enabled"] = list(selected)
+    agent_cfg.pop("types", None)
     if len(selected) == 1:
         agent_cfg["credentials_var"] = LEGACY_CODING_AGENT_API_KEY
         agent_cfg.pop("credentials", None)

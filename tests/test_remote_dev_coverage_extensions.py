@@ -1001,7 +1001,7 @@ class TestRemoteDevEnvironmentMore:
 
         cfg = ProjectConfig(str(tmp_path))
         cfg.init(name="att", agent_type="opencode")
-        cfg.set("agent.type", "claude")
+        cfg.set("agent.default", "claude")
         cfg.save()
 
         with patch.object(RemoteDevEnvironment, "_run_attach_ssh", return_value=0), patch(
@@ -1101,8 +1101,30 @@ class TestWorkspaceAndInteractive:
         manifest = ws.manifest_path
         import yaml
         data = yaml.safe_load(open(manifest, encoding="utf-8"))
-        assert data["agent"]["type"] == "opencode"
-        assert data["agent"]["types"] == ["opencode", "claude"]
+        assert data["agent"]["default"] == "opencode"
+        assert data["agent"]["enabled"] == ["opencode", "claude"]
+
+    def test_workspace_init_selects_multiple_editors(self, tmp_path):
+        ws = Workspace(str(tmp_path))
+        assert ws.init(
+            name="ws",
+            editors=["code", "cursor"],
+            editor="not-an-editor",
+        )
+        import yaml
+        data = yaml.safe_load(open(ws.manifest_path, encoding="utf-8"))
+        assert data["editor"]["default"] == "code"
+        assert data["editor"]["enabled"] == ["code", "cursor"]
+
+    def test_workspace_init_bad_editor_list_falls_back(self, tmp_path):
+        root = tmp_path / "bad-editors"
+        root.mkdir()
+        ws = Workspace(str(root))
+        assert ws.init(name="ws", editors=["not-an-editor"])
+        import yaml
+        data = yaml.safe_load(open(ws.manifest_path, encoding="utf-8"))
+        assert data["editor"]["default"] == "code"
+        assert data["editor"]["enabled"] == ["code"]
 
     def test_configured_agents_without_project_and_non_member_default(self):
         assert configured_agents(None) == (["opencode"], "opencode")
@@ -1143,7 +1165,7 @@ class TestWorkspaceAndInteractive:
         ), patch("cli.vault_keys.read_wrap_fields", return_value={}), patch(
             "cli.agents.prompt_coding_agents",
             return_value=["opencode"],
-        ), patch("cli.remote_dev.prompt_editor", return_value="code"), patch(
+        ), patch("cli.remote_dev.prompt_editors", return_value=["code"]), patch(
             "cli.encrypt.collect_repo_pats",
             return_value=({}, {}),
         ), patch(
@@ -1428,14 +1450,14 @@ class TestRemoteDevAttachAndEditors:
         monkeypatch.setattr(
             RemoteDevEnvironment,
             "resolve_editor_command",
-            staticmethod(lambda prefer=None: None),
+            staticmethod(lambda prefer=None, fallbacks=None: None),
         )
         assert env.open_vscode(browser=False) == 1
 
         monkeypatch.setattr(
             RemoteDevEnvironment,
             "resolve_editor_command",
-            staticmethod(lambda prefer=None: "/bin/false-editor"),
+            staticmethod(lambda prefer=None, fallbacks=None: "/bin/false-editor"),
         )
 
         def _raise_fnf(*_a, **_k):
@@ -1447,7 +1469,7 @@ class TestRemoteDevAttachAndEditors:
         monkeypatch.setattr(
             RemoteDevEnvironment,
             "resolve_editor_command",
-            staticmethod(lambda prefer=None: "/bin/good"),
+            staticmethod(lambda prefer=None, fallbacks=None: "/bin/good"),
         )
         monkeypatch.setattr(
             "cli.remote_dev.subprocess.run",
@@ -1931,7 +1953,7 @@ class TestInteractiveEnvInitBranches:
             "cli.agents.prompt_coding_agents",
             MagicMock(return_value=["opencode"]),
         )
-        monkeypatch.setattr("cli.remote_dev.prompt_editor", MagicMock(return_value="code"))
+        monkeypatch.setattr("cli.remote_dev.prompt_editors", MagicMock(return_value=["code"]))
         for key, val in extra.items():
             monkeypatch.setattr(key, val)
 
@@ -2048,7 +2070,87 @@ class TestInteractiveEnvInitBranches:
         )
         import yaml
         manifest = yaml.safe_load((root / "rig.yml").read_text())
-        assert manifest["agent"]["type"] == "claude"
+        assert manifest["agent"]["default"] == "claude"
+
+    def test_string_editor_prompt_is_coerced(self, tmp_path, monkeypatch):
+        root = tmp_path / "ie-ed"
+        root.mkdir()
+        (root / "svc").mkdir()
+        (root / "rig.yml").write_text("name: z\n", encoding="utf-8")
+        self._patch_core(
+            root,
+            [{"name": "svc", "path": str(root / "svc")}],
+            monkeypatch,
+        )
+        monkeypatch.setattr(
+            "cli.remote_dev.prompt_editors",
+            MagicMock(return_value="cursor"),
+        )
+        inputs = iter(["all", "wspace"])
+        assert (
+            interactive_env_init(
+                start=str(root),
+                input_fn=lambda _: next(inputs),
+            )
+            is True
+        )
+        import yaml
+        manifest = yaml.safe_load((root / "rig.yml").read_text())
+        assert manifest["editor"]["default"] == "cursor"
+        assert manifest["editor"]["enabled"] == ["cursor"]
+
+    def test_invalid_string_editor_prompt_falls_back(self, tmp_path, monkeypatch):
+        root = tmp_path / "ie-ed-bad"
+        root.mkdir()
+        (root / "svc").mkdir()
+        (root / "rig.yml").write_text("name: z\n", encoding="utf-8")
+        self._patch_core(
+            root,
+            [{"name": "svc", "path": str(root / "svc")}],
+            monkeypatch,
+        )
+        monkeypatch.setattr(
+            "cli.remote_dev.prompt_editors",
+            MagicMock(return_value="not-an-editor"),
+        )
+        inputs = iter(["all", "wspace"])
+        assert (
+            interactive_env_init(
+                start=str(root),
+                input_fn=lambda _: next(inputs),
+            )
+            is True
+        )
+        import yaml
+        manifest = yaml.safe_load((root / "rig.yml").read_text())
+        assert manifest["editor"]["default"] == "code"
+        assert manifest["editor"]["enabled"] == ["code"]
+
+    def test_prompt_default_editor_value_error(self, tmp_path, monkeypatch):
+        root = tmp_path / "ie-edef"
+        root.mkdir()
+        (root / "rig.yml").write_text("name: z\n", encoding="utf-8")
+        self._patch_core(
+            root,
+            [{"name": "svc", "path": str(root / "svc")}],
+            monkeypatch,
+        )
+        monkeypatch.setattr(
+            "cli.remote_dev.prompt_editors",
+            MagicMock(return_value=["code", "cursor"]),
+        )
+        monkeypatch.setattr(
+            "cli.remote_dev.prompt_default_editor",
+            MagicMock(side_effect=ValueError("bad default")),
+        )
+        inputs = iter(["all", "wspace"])
+        assert (
+            interactive_env_init(
+                start=str(root),
+                input_fn=lambda _: next(inputs),
+            )
+            is False
+        )
 
     def test_prompt_editor_value_error(self, tmp_path, monkeypatch):
         root = tmp_path / "ie6"
@@ -2060,7 +2162,7 @@ class TestInteractiveEnvInitBranches:
             monkeypatch,
         )
         monkeypatch.setattr(
-            "cli.remote_dev.prompt_editor",
+            "cli.remote_dev.prompt_editors",
             MagicMock(side_effect=ValueError("ed")),
         )
         inputs = iter(["all", "wspace"])

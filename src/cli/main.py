@@ -6,6 +6,7 @@ Main entry point for the remote development environment CLI
 import argparse
 import sys
 import os
+from typing import List, Optional
 
 # Add the src directory to the path so we can import our modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + '/..')
@@ -388,15 +389,43 @@ def _cmd_dev(args: argparse.Namespace) -> int:
 
         env.ensure_firewall_access(project_dir=os.getcwd())
         remember_last_env(env.name)
-        editor = getattr(args, "editor", None)
-        if not editor:
-            from cli.remote_dev import project_editor_preference
-            editor = project_editor_preference(os.getcwd())
+        from cli.remote_dev import configured_editors, normalize_editor_type
+
+        project = ProjectConfig(os.getcwd())
+        project.load()
+        enabled, default_editor = configured_editors(project)
+        requested = getattr(args, "editor", None)
+        editor: Optional[str] = None
+        editor_fallbacks: Optional[List[str]] = None
+        if requested:
+            try:
+                editor = normalize_editor_type(requested)
+            except ValueError as exc:
+                log.error("%s", exc)
+                return 1
+            if enabled and editor not in enabled:
+                log.error(
+                    "Editor '%s' is not enabled for this workspace (enabled: %s)",
+                    editor,
+                    ", ".join(enabled),
+                )
+                return 1
+            editor_fallbacks = []
+        else:
+            editor = default_editor
+            editor_fallbacks = list(enabled) if enabled else None
+        if len(enabled) > 1 and editor:
+            log.info(
+                "Workspace editors: %s (opening %s)",
+                ", ".join(enabled),
+                editor,
+            )
         return env.open_vscode(
             remote_path=getattr(args, "path", None) or REMOTE_WORKSPACE_ROOT,
             project_dir=os.getcwd(),
             browser=bool(getattr(args, "browser", False)),
             editor=editor,
+            editor_fallbacks=editor_fallbacks,
         )
     except Exception as e:
         log.error("Error opening VS Code: %s", e)
@@ -910,7 +939,7 @@ def main(argv=None):
         dest="agent",
         help=(
             "Coding agent to open when several are configured "
-            "(opencode, claude, or cursor). Defaults to agent.type"
+            "(opencode, claude, or cursor). Defaults to agent.default"
         ),
     )
     attach_parser.add_argument(
@@ -949,8 +978,11 @@ def main(argv=None):
     )
     dev_parser.add_argument(
         "--editor",
-        choices=["code", "code-insiders", "cursor", "codium"],
-        help="Prefer a specific local editor CLI (overrides editor in rig.yml)",
+        help=(
+            "Local editor to open when several are configured "
+            "(code, code-insiders, cursor, or codium). "
+            "Defaults to editor.default in rig.yml"
+        ),
     )
 
     subparsers.add_parser("list", help="List remote environments")
