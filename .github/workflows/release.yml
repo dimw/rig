@@ -2,7 +2,7 @@ name: Release
 
 # Publishes to PyPI only when a version tag is pushed.
 # v1.2.3 and 1.2.3 both publish mystack-rig 1.2.3.
-# Create a repository Actions variable named PYPI_API_TOKEN
+# Create a repository Actions secret named PYPI_API_TOKEN
 # (a PyPI API token, including the pypi- prefix). The token is not printed.
 
 on:
@@ -60,17 +60,17 @@ jobs:
       - name: Check package metadata
         run: python -m twine check dist/*
 
-      - name: Require the PyPI API token variable
+      - name: Require the PyPI API token secret
         env:
-          TWINE_PASSWORD: ${{ vars.PYPI_API_TOKEN }}
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
           if [ -z "$TWINE_PASSWORD" ]; then
-            echo "Create a GitHub Actions variable named PYPI_API_TOKEN with a PyPI API token (include the pypi- prefix)."
+            echo "Create a GitHub Actions secret named PYPI_API_TOKEN with a PyPI API token (include the pypi- prefix)."
             exit 1
           fi
 
       - name: Publish to PyPI
         env:
           TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ vars.PYPI_API_TOKEN }}
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: python -m twine upload --non-interactive dist/*
