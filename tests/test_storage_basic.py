@@ -519,6 +519,63 @@ class TestStorageErrorHandling:
             mock_s3.download_file.side_effect = not_found
             assert StorageManager().download_file(test_bucket_name, "k", out) is False
 
+    def test_list_objects_retries_missing_bucket(
+        self, hetzner_token, s3_credentials, test_bucket_name
+    ):
+        from cli.storage import StorageManager
+        from botocore.exceptions import ClientError
+
+        missing = ClientError(
+            error_response={
+                "Error": {"Code": "NoSuchBucket", "Message": "gone"},
+                "ResponseMetadata": {"HTTPStatusCode": 404},
+            },
+            operation_name="ListObjectsV2",
+        )
+        with patch("boto3.client") as mock_boto, patch("cli.storage.time.sleep"):
+            mock_s3 = MagicMock()
+            mock_boto.return_value = mock_s3
+            mock_s3.list_objects_v2.side_effect = [
+                missing,
+                {"Contents": [{"Key": "lifecycle.txt"}]},
+            ]
+            assert StorageManager().list_objects(test_bucket_name) == ["lifecycle.txt"]
+            assert mock_s3.list_objects_v2.call_count == 2
+
+    def test_delete_retries_missing_bucket(
+        self, hetzner_token, s3_credentials, test_bucket_name
+    ):
+        from cli.storage import StorageManager
+        from botocore.exceptions import ClientError
+
+        missing = ClientError(
+            error_response={
+                "Error": {"Code": "NoSuchBucket", "Message": "gone"},
+                "ResponseMetadata": {"HTTPStatusCode": 404},
+            },
+            operation_name="DeleteObject",
+        )
+        with patch("boto3.client") as mock_boto, patch("cli.storage.time.sleep"):
+            mock_s3 = MagicMock()
+            mock_boto.return_value = mock_s3
+            mock_s3.delete_object.side_effect = [missing, None]
+            assert StorageManager().delete_object(test_bucket_name, "lifecycle.txt") is True
+            assert mock_s3.delete_object.call_count == 2
+
+        gone = ClientError(
+            error_response={
+                "Error": {"Code": "NoSuchBucket", "Message": "gone"},
+                "ResponseMetadata": {"HTTPStatusCode": 404},
+            },
+            operation_name="DeleteBucket",
+        )
+        with patch("boto3.client") as mock_boto, patch("cli.storage.time.sleep"):
+            mock_s3 = MagicMock()
+            mock_boto.return_value = mock_s3
+            mock_s3.delete_bucket.side_effect = gone
+            mock_s3.head_bucket.side_effect = gone
+            assert StorageManager().delete_bucket(test_bucket_name) is True
+
     def test_list_objects_and_delete_errors(
         self, hetzner_token, s3_credentials, test_bucket_name
     ):
@@ -543,13 +600,24 @@ class TestStorageErrorHandling:
             )
             assert StorageManager().delete_object(test_bucket_name, "k") is False
 
-        with patch("boto3.client") as mock_boto:
+        ticks = iter([0.0, 0.1, 100.0])
+
+        def fake_time():
+            try:
+                return next(ticks)
+            except StopIteration:
+                return 999.0
+
+        with patch("boto3.client") as mock_boto, patch("cli.storage.time.sleep"), patch(
+            "cli.storage.time.time", side_effect=fake_time
+        ):
             mock_s3 = MagicMock()
             mock_boto.return_value = mock_s3
             mock_s3.delete_bucket.side_effect = ClientError(
                 error_response={"Error": {"Code": "BucketNotEmpty", "Message": "no"}},
                 operation_name="DeleteBucket",
             )
+            mock_s3.head_bucket.return_value = {}
             assert StorageManager().delete_bucket(test_bucket_name) is False
 
     def test_credentials_info_short_token(self, hetzner_token, s3_credentials):

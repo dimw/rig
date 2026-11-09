@@ -243,44 +243,96 @@ class StorageManager:
         return False
 
     def list_objects(self, bucket_name: str, prefix: str = "") -> list:
-        """List objects in a bucket"""
-        try:
-            s3_client = self._get_s3_client()
-            response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
-            objects = []
-            if 'Contents' in response:
-                objects = [obj['Key'] for obj in response['Contents']]
-            log.debug("Storage objects in %r (prefix %r): %s", bucket_name, prefix, objects)
-            return objects
-        except ClientError as e:
-            log.warning("Could not list storage objects: %s", e)
-            return []
+        """List objects in a bucket.
+
+        Hetzner Object Storage can return NoSuchBucket for a short window
+        after a successful upload, so that response is retried.
+        """
+        s3_client = self._get_s3_client()
+        deadline = time.time() + 30.0
+        delay = 0.2
+        last_error: Optional[BaseException] = None
+        while time.time() < deadline:
+            try:
+                response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+                objects = []
+                if 'Contents' in response:
+                    objects = [obj['Key'] for obj in response['Contents']]
+                log.debug(
+                    "Storage objects in %r (prefix %r): %s",
+                    bucket_name,
+                    prefix,
+                    objects,
+                )
+                return objects
+            except ClientError as e:
+                last_error = e
+                if self._is_not_found(e):
+                    time.sleep(delay)
+                    delay = min(delay * 1.5, 2.0)
+                    continue
+                log.warning("Could not list storage objects: %s", e)
+                return []
+        log.warning("Could not list storage objects: %s", last_error)
+        return []
 
     def delete_object(self, bucket_name: str, object_name: str) -> bool:
-        """Delete an object from storage"""
-        try:
-            s3_client = self._get_s3_client()
-            s3_client.delete_object(Bucket=bucket_name, Key=object_name)
-            log.debug("Deleted %s/%s", bucket_name, object_name)
-            return True
-        except ClientError as e:
-            error_code = e.response.get("Error", {}).get("Code", "")
-            # Idempotent: missing key is fine; missing bucket is not.
-            if error_code in ("NoSuchKey", "404", "NotFound"):
+        """Delete an object from storage.
+
+        A missing key is success. NoSuchBucket is retried because the gateway
+        can report it while the bucket is still there.
+        """
+        s3_client = self._get_s3_client()
+        deadline = time.time() + 30.0
+        delay = 0.2
+        last_error: Optional[BaseException] = None
+        while time.time() < deadline:
+            try:
+                s3_client.delete_object(Bucket=bucket_name, Key=object_name)
+                log.debug("Deleted %s/%s", bucket_name, object_name)
                 return True
-            log.warning("Could not delete storage object: %s", e)
-            return False
+            except ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code in ("NoSuchKey", "404", "NotFound"):
+                    return True
+                last_error = e
+                if error_code == "NoSuchBucket" or self._is_not_found(e):
+                    time.sleep(delay)
+                    delay = min(delay * 1.5, 2.0)
+                    continue
+                log.warning("Could not delete storage object: %s", e)
+                return False
+        log.warning("Could not delete storage object: %s", last_error)
+        return False
 
     def delete_bucket(self, bucket_name: str) -> bool:
-        """Delete a bucket"""
-        try:
-            s3_client = self._get_s3_client()
-            s3_client.delete_bucket(Bucket=bucket_name)
-            log.debug("Deleted storage bucket %r", bucket_name)
-            return True
-        except ClientError as e:
-            log.warning("Could not delete storage bucket: %s", e)
-            return False
+        """Delete a bucket. A bucket that is already gone counts as deleted."""
+        s3_client = self._get_s3_client()
+        deadline = time.time() + 30.0
+        delay = 0.2
+        last_error: Optional[BaseException] = None
+        while time.time() < deadline:
+            try:
+                s3_client.delete_bucket(Bucket=bucket_name)
+                log.debug("Deleted storage bucket %r", bucket_name)
+                return True
+            except ClientError as e:
+                last_error = e
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code in ("BucketNotEmpty", "NoSuchBucket") or self._is_not_found(e):
+                    try:
+                        s3_client.head_bucket(Bucket=bucket_name)
+                    except ClientError as head_exc:
+                        if self._is_not_found(head_exc):
+                            log.debug("Storage bucket %r is already gone", bucket_name)
+                            return True
+                    time.sleep(delay)
+                    delay = min(delay * 1.5, 2.0)
+                    continue
+                log.warning("Could not delete storage bucket: %s", e)
+                return False
+        log.warning("Could not delete storage bucket: %s", last_error)
+        return False
 
     def get_credentials_info(self) -> Dict[str, str]:
         """Return information about the configured credentials (token masked)."""
