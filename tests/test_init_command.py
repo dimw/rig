@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from cli.main import main
 from cli.remote_dev import (
+    ProjectConfig,
+    Workspace,
     _VarsLoader,
     discover_git_projects,
     interactive_env_init,
@@ -193,6 +195,34 @@ def test_interactive_init_selects_projects(tmp_path):
     assert "https://github.com/org/api.git" in vars_text
     assert "https://github.com/mystack-cloud/rig.git" in vars_text
     assert "git_pat:" not in vars_text
+
+
+def test_workspace_init_reduces_repos_on_reinit(tmp_path):
+    root = tmp_path / "mystack"
+    api = root / "api"
+    app = root / "app"
+    rig = root / "rig"
+    _git_init(api, "https://github.com/org/api.git")
+    _git_init(app, "https://github.com/org/app.git")
+    _git_init(rig, "https://github.com/org/rig.git")
+
+    ws = Workspace(str(rig))
+    both = [
+        {"name": "api", "url": "https://github.com/org/api.git", "path": str(api)},
+        {"name": "app", "url": "https://github.com/org/app.git", "path": str(app)},
+    ]
+    assert ws.init(name="rig", repos=both)
+    assert ws.init(name="rig", repos=[both[0]])
+
+    manifest = yaml.safe_load((rig / "rig.yml").read_text())
+    assert {repo["name"] for repo in manifest["repos"]} == {"api"}
+
+    project = ProjectConfig(str(rig))
+    project.load()
+    clone_repos = project.get_vars("git.clone_repos") or []
+    assert {item["repo"] for item in clone_repos} == {
+        "https://github.com/org/api.git"
+    }
 
 
 def test_interactive_init_defaults_to_current_repo(tmp_path):
