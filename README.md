@@ -255,7 +255,7 @@ python -m pytest tests/ -m "not requires_credentials"
 
 ## Release
 
-Push a version tag to publish that version to PyPI. The package version is the tag without an optional leading `v` (`v0.2.0` publishes `0.2.0`). The workflow reads the GitHub Actions variable `PYPI_API_TOKEN` (a PyPI API token, including the `pypi-` prefix).
+Push a version tag to publish that version to PyPI. The package version is the tag without an optional leading `v` (`v0.2.0` publishes `0.2.0`). The workflow reads the GitHub Actions secret `PYPI_API_TOKEN` (a PyPI API token, including the `pypi-` prefix).
 
 ## License
 
