@@ -12,8 +12,6 @@ rig init
 rig create
 ```
 
-The published project name is `mystack-rig` (the PyPI name `rig` belongs to another project). The command is still `rig`. From a checkout, `pip install .` installs the same command.
-
 ## Architecture
 
 Run `rig` from your machine, CI/CD, or a control plane: it provisions cloud VMs you can create and dispose anytime, and you work on `/workspace` via agent TTY or editor. SSH/HTTPS reaches VMs through the firewall; HTTPS reaches the provider. The CLI stores env state in S3-compatible object storage.
@@ -247,6 +245,15 @@ Also available from vars files (defaults): `workspace_root`, `coding_agent_type`
 `RIG_IDENTITY` overrides the configured identity. Teammates joining an existing workspace paste the shared data key once (`rig vars export-shared-key` from an unlocked machine).
 
 OpenCode without an API key uses free Zen models. With a key, config switches to the paid provider path. When several agents are selected, keys are `opencode_api_key`, `claude_api_key`, and `cursor_api_key` (`RIG_OPENCODE_API_KEY`, `RIG_ANTHROPIC_API_KEY`, `RIG_CURSOR_API_KEY`). A single agent still uses `coding_agent_api_key` (`RIG_CODING_AGENT_API_KEY`).
+
+## Development
+
+From a checkout, `pip install .` installs the same `rig` command. Use an editable install so the command keeps using this tree while you change it:
+
+```bash
+pip install -e .
+rig --version
+```
 
 ## Tests
 
