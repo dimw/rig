@@ -1,3 +1,4 @@
+[![PyPI](https://img.shields.io/pypi/v/mystack-rig)](https://pypi.org/project/mystack-rig/)
 [![Tests](https://github.com/mystack-cloud/rig/actions/workflows/tests.yml/badge.svg)](https://github.com/mystack-cloud/rig/actions/workflows/tests.yml)
 [![codecov](https://codecov.io/gh/mystack-cloud/rig/graph/badge.svg)](https://codecov.io/gh/mystack-cloud/rig)
 
