@@ -4550,6 +4550,8 @@ class Workspace:
         if project.get_vars("git.ssh_repos") is None:
             project.set_vars("git.ssh_repos", [])
 
+        from cli.encrypt import to_https_git_url
+
         for repo in selected:
             repo_name = repo["name"]
             if not _valid_component_name(repo_name):
@@ -4566,7 +4568,6 @@ class Workspace:
             if relative and relative not in (".", ""):
                 entry["path"] = relative.replace(os.sep, "/")
             if url:
-                from cli.encrypt import to_https_git_url
                 # Always record/clone HTTPS so PATs work for clone + gh/glab auth.
                 https_url = to_https_git_url(url)
                 if https_url != url:
@@ -4607,10 +4608,7 @@ class Workspace:
             if not url:
                 continue
             kept_urls.add(str(url))
-            from cli.encrypt import to_https_git_url
-
-            https = to_https_git_url(str(url))
-            kept_urls.add(https)
+            kept_urls.add(to_https_git_url(str(url)))
 
         git_config = project.get_vars("git") or {}
         for key in ("clone_repos", "ssh_repos"):
