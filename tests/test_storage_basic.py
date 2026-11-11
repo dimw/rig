@@ -358,12 +358,24 @@ class TestStorageErrorHandling:
             operation_name="HeadBucket",
         )
 
+        hard = ClientError(
+            error_response={
+                "Error": {"Code": "InternalError"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            operation_name="HeadBucket",
+        )
+
         with patch.object(storage, "_get_s3_client", return_value=client):
             assert storage.bucket_exists(test_bucket_name) is True
             client.head_bucket.side_effect = missing
             assert storage.bucket_exists(test_bucket_name) is False
             client.head_bucket.side_effect = forbidden
             assert storage.bucket_exists(test_bucket_name) is True
+            client.head_bucket.side_effect = hard
+            assert storage.bucket_exists(test_bucket_name) is False
+            client.head_bucket.side_effect = RuntimeError("network down")
+            assert storage.bucket_exists(test_bucket_name) is False
 
     def test_wait_for_bucket_hard_error_and_timeout(
         self, hetzner_token, s3_credentials, test_bucket_name
